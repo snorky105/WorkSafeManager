@@ -1,0 +1,7 @@
+{
+  "host": "localhost",
+  "port": 3050,
+  "database": "C:/FirebirdDB/DBSYTE.fdb",
+  "user": "SYSDBA",
+  "password": "masterkey"
+}
