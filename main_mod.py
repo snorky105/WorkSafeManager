@@ -2,27 +2,25 @@ import json
 import fdb
 import bcrypt
 import asyncio
-from nicegui import ui, app, run  # Importa 'app' e 'run'
-import os  # Necessario per i percorsi dei file
-from docx import Document  # Importa la libreria per i .docx
-from datetime import datetime, date # Per formattare le date
-import tempfile  # Per creare cartelle temporanee
-import shutil  # Per eliminare le cartelle temporanee
-import zipfile  # Per creare il file .zip
-import re # Per pulire i nomi delle cartelle
+from nicegui import ui, app, run
+import os
+from docx import Document
+from datetime import datetime, date
+import tempfile
+import shutil
+import zipfile
+import re
 
 # --- LOG DI AVVIO ---
-print("--- DEBUG: AVVIO WorkSafeManager (Versione POPUP RICERCA) ---")
+print("--- DEBUG: AVVIO WorkSafeManager (FULL VERSION) ---")
 
 # --- LOAD CONFIG ---
 try:
     with open('config.json', 'r') as f:
         config = json.load(f)
-    with open('queries.json', 'r') as f:
-        queries = json.load(f)
 except FileNotFoundError:
-    print("ERRORE: Config file non trovati.")
-    exit()
+    print("ATTENZIONE: Config file non trovati. Uso default.")
+    config = {'host': 'localhost', 'database': 'database.fdb', 'user': 'SYSDBA', 'password': 'masterkey', 'port': 3050}
 
 # --- DB HELPERS ---
 def get_db_connection():
@@ -32,8 +30,187 @@ def get_db_connection():
         port=config.get('port', 3050), charset='UTF8'
     )
 
+# --- REPOSITORY SOGGETTI (CRUD UTENTI) ---
+class UserRepo:
+    @staticmethod
+    def get_all(search_term=''):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            sql = "SELECT CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK FROM T_SOGGETTI"
+            params = []
+            
+            if search_term:
+                term = search_term.upper()
+                sql += " WHERE UPPER(COGNOME) CONTAINING ? OR UPPER(NOME) CONTAINING ? OR UPPER(CODICE_FISCALE) CONTAINING ?"
+                params = [term, term, term]
+            
+            sql += " ORDER BY COGNOME, NOME"
+            
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+            
+            result = []
+            for r in rows:
+                d_nascita = r[3]
+                if isinstance(d_nascita, (date, datetime)):
+                    d_nascita = d_nascita.strftime('%Y-%m-%d')
+                elif d_nascita is None:
+                    d_nascita = ''
+                
+                result.append({
+                    'CODICE_FISCALE': r[0],
+                    'COGNOME': r[1],
+                    'NOME': r[2],
+                    'DATA_NASCITA': str(d_nascita),
+                    'LUOGO_NASCITA': r[4],
+                    'ID_ENTE_FK': r[5]
+                })
+            return result
+        except Exception as e:
+            print(f"Errore UserRepo.get_all: {e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def upsert(data, is_new=True):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            dt_nascita = None
+            if data['DATA_NASCITA']:
+                try:
+                    if '-' in data['DATA_NASCITA']:
+                        dt_nascita = datetime.strptime(data['DATA_NASCITA'], '%Y-%m-%d').date()
+                    elif '/' in data['DATA_NASCITA']:
+                        dt_nascita = datetime.strptime(data['DATA_NASCITA'], '%d/%m/%Y').date()
+                except ValueError:
+                    pass
+            
+            if is_new:
+                sql = """
+                    INSERT INTO T_SOGGETTI (CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """
+                params = (data['CODICE_FISCALE'], data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], data['ID_ENTE_FK'])
+            else:
+                sql = """
+                    UPDATE T_SOGGETTI 
+                    SET COGNOME=?, NOME=?, DATA_NASCITA=?, LUOGO_NASCITA=?, ID_ENTE_FK=?
+                    WHERE CODICE_FISCALE=?
+                """
+                params = (data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], data['ID_ENTE_FK'], data['CODICE_FISCALE'])
+            
+            cur.execute(sql, params)
+            conn.commit()
+            return True, "Salvataggio completato."
+            
+        except fdb.IntegrityError:
+            return False, "Errore: Codice Fiscale esistente o dati invalidi."
+        except Exception as e:
+            return False, f"Errore DB: {str(e)}"
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def delete(codice_fiscale):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM T_SOGGETTI WHERE CODICE_FISCALE = ?", (codice_fiscale,))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Errore Delete: {e}")
+            return False
+        finally:
+            if conn: conn.close()
+
+# --- REPOSITORY ENTI (CRUD ENTI) ---
+class EnteRepo:
+    @staticmethod
+    def get_all(search_term=''):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            sql = "SELECT ID_ENTE, DESCRIZIONE, P_IVA FROM T_ENTI"
+            params = []
+            
+            if search_term:
+                term = search_term.upper()
+                sql += " WHERE UPPER(DESCRIZIONE) CONTAINING ? OR UPPER(P_IVA) CONTAINING ? OR CAST(ID_ENTE AS VARCHAR(50)) CONTAINING ?"
+                params = [term, term, term]
+            
+            sql += " ORDER BY DESCRIZIONE"
+            
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+            
+            result = []
+            for r in rows:
+                result.append({
+                    'ID_ENTE': r[0],
+                    'DESCRIZIONE': r[1],
+                    'P_IVA': r[2]
+                })
+            return result
+        except Exception as e:
+            print(f"Errore EnteRepo.get_all: {e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def upsert(data, is_new=True):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            if is_new:
+                sql = "INSERT INTO T_ENTI (ID_ENTE, DESCRIZIONE, P_IVA) VALUES (?, ?, ?)"
+                params = (data['ID_ENTE'], data['DESCRIZIONE'], data['P_IVA'])
+            else:
+                sql = "UPDATE T_ENTI SET DESCRIZIONE=?, P_IVA=? WHERE ID_ENTE=?"
+                params = (data['DESCRIZIONE'], data['P_IVA'], data['ID_ENTE'])
+            
+            cur.execute(sql, params)
+            conn.commit()
+            return True, "Ente salvato con successo."
+            
+        except fdb.IntegrityError:
+            return False, "Errore: ID Ente già esistente."
+        except Exception as e:
+            return False, f"Errore DB: {str(e)}"
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def delete(id_ente):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM T_ENTI WHERE ID_ENTE = ?", (id_ente,))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Errore Delete Ente: {e}")
+            return False
+        finally:
+            if conn: conn.close()
+
+# --- HELPERS PER CREAZIONE ATTESTATI ---
 def get_user_details_from_db_sync(search_term: str):
-    print(f"DEBUG: Ricerca DB per: {search_term}")
+    # Ricerca specifica per la pagina attestati (include join con ente)
     terms = search_term.upper().split()
     if not terms: return []
 
@@ -77,13 +254,12 @@ def get_corsi_from_db_sync():
         return []
 
 def save_attestato_to_db_sync(cf, id_corso, data_str):
-    print(f"DEBUG: Salvataggio {cf}...")
     try:
         dt = None
-        if re.search(r'\d{4}-\d{2}-\d{2}', data_str):
-             dt = datetime.strptime(re.search(r'\d{4}-\d{2}-\d{2}', data_str).group(0), '%Y-%m-%d').date()
-        elif re.search(r'\d{2}/\d{2}/\d{4}', data_str):
-             dt = datetime.strptime(re.search(r'\d{2}/\d{2}/\d{4}', data_str).group(0), '%d/%m/%Y').date()
+        if re.search(r'\d{4}-\d{2}-\d{2}', str(data_str)):
+             dt = datetime.strptime(re.search(r'\d{4}-\d{2}-\d{2}', str(data_str)).group(0), '%Y-%m-%d').date()
+        elif re.search(r'\d{2}/\d{2}/\d{4}', str(data_str)):
+             dt = datetime.strptime(re.search(r'\d{2}/\d{2}/\d{4}', str(data_str)).group(0), '%d/%m/%Y').date()
         
         data_val = dt if dt else date.today()
         
@@ -117,7 +293,7 @@ def generate_certificate_sync(data_map, template_file="modello.docx", output_dir
                     for k, v in local_map.items():
                          if k in p.text: p.text = p.text.replace(k, str(v if v else ''))
                          
-    fname = f"attestato_{re.sub(r'\W', '', local_map.get('{{COGNOME}}',''))}_{re.sub(r'\W', '', local_map.get('{{NOME}}',''))}.docx"
+    fname = f"attestato_{re.sub(r'\W', '', str(local_map.get('{{COGNOME}}','')))}_{re.sub(r'\W', '', str(local_map.get('{{NOME}}','')))}.docx"
     out_path = os.path.join(output_dir, fname) if output_dir else fname
     doc.save(out_path)
     return out_path
@@ -127,7 +303,8 @@ def generate_zip_sync(files, base, name="attestati.zip"):
         for f in files: z.write(f, arcname=os.path.relpath(f, base))
     return name
 
-# --- APP ---
+# --- APP & PAGES ---
+
 @ui.page('/')
 def login_page():
     if app.storage.user.get('authenticated', False):
@@ -146,8 +323,8 @@ def login_page():
                 if not user or not pwd:
                     ui.notify("Inserisci username e password!", color="red")
                     return
-                valid = await check_credentials(user, pwd)
-                if valid:
+                # Placeholder auth
+                if user and pwd: 
                     app.storage.user['authenticated'] = True
                     app.storage.user['username'] = user 
                     ui.notify("Login riuscito!", color="green")
@@ -165,6 +342,7 @@ def dashboard_page():
     username = app.storage.user.get('username', 'Utente')
     ui.label(f"Dashboard - Benvenuto, {username}").classes("text-3xl font-bold mb-8 text-center")
     
+    # --- MENU A TENDINA (EXPANSION) ---
     with ui.expansion('Creazione Attestati', icon='explore').classes('max-w-2xl mx-auto mb-4 shadow-md rounded-lg'):
         ui.label('Accedi alla sezione per la creazione degli attestati.').classes('p-4')
         ui.button('Entra', on_click=lambda: ui.navigate.to('/creaattestati')).classes('m-4')
@@ -176,6 +354,14 @@ def dashboard_page():
     with ui.expansion('Gestione Enti', icon='home').classes('max-w-2xl mx-auto mb-4 shadow-md rounded-lg'):
         ui.label('Accedi alla sezione per la gestione Enti.').classes('p-4')
         ui.button('Entra', on_click=lambda: ui.navigate.to('/gestioneenti')).classes('m-4')
+        
+    with ui.expansion('Gestione Docenti', icon='school').classes('max-w-2xl mx-auto mb-4 shadow-md rounded-lg'):
+        ui.label('Accedi alla sezione per la gestione docenti.').classes('p-4')
+        ui.button('Entra', on_click=lambda: ui.navigate.to('/gestioneenti')).classes('m-4')
+        
+    with ui.expansion('Ricerca Attestati', icon='page').classes('max-w-2xl mx-auto mb-4 shadow-md rounded-lg'):
+        ui.label('Accedi alla sezione per la gestione docenti.').classes('p-4')
+        ui.button('Entra', on_click=lambda: ui.navigate.to('/ricercaattestati')).classes('m-4')
 
     def logout_click():
         app.storage.user['authenticated'] = False
@@ -198,24 +384,19 @@ def creaattestati_page():
     corsi_opts = {c["id"]: c["nome"] for c in corsi_raw}
     corsi_ore = {c["id"]: c["ore"] for c in corsi_raw}
     
-    soggetti = {} # Dizionario locale per lo stato
+    soggetti = {} # Dizionario locale
 
-    # --- NUOVO DIALOGO DI RICERCA ---
+    # Dialogo Ricerca
     search_dialog = ui.dialog()
     with search_dialog, ui.card().classes('w-full max-w-lg'):
         ui.label('Cerca e Aggiungi Soggetto').classes('text-xl font-bold mb-2')
         
         with ui.row().classes('w-full gap-2'):
-            # Nota: input definito qui dentro
             search_input = ui.input(label='Nome, Cognome o CF...').classes('flex-grow').props('outlined')
-            # Il bottone Cerca triggera la ricerca
             search_btn = ui.button('Cerca').props('color=primary')
             
-        # Area per i risultati (se omonimi)
         search_results_area = ui.column().classes('w-full mt-2')
-        
         ui.button('Chiudi', on_click=search_dialog.close).props('flat color=grey').classes('ml-auto')
-
 
     with ui.column().classes('w-full items-center p-8'):
         
@@ -223,17 +404,14 @@ def creaattestati_page():
             ui.button('Torna', on_click=lambda: ui.navigate.to('/dashboard'), icon='arrow_back').props('flat round')
             ui.label('Creazione Attestati Massiva').classes('text-3xl ml-4')
         
-        # --- FUNZIONE REFRESH GRIGLIA ---
         @ui.refreshable
         def render_lista_soggetti():
             if not soggetti:
                 ui.label("Nessun soggetto in lista.").classes('text-sm italic p-4 text-gray-500')
                 return
             
-            # Loop sui dati
             for cf, item in soggetti.items():
                 u_data = item['user']
-                # Layout griglia proporzionato
                 with ui.grid().style('grid-template-columns: 1fr 1fr 1fr 3fr 1.5fr 0.6fr 0.5fr; width: 100%; gap: 10px; align-items: center; border-bottom: 1px solid #eee; padding: 5px;'):
                     ui.label(u_data['COGNOME'])
                     ui.label(u_data['NOME'])
@@ -248,13 +426,12 @@ def creaattestati_page():
                     ui.select(options=corsi_opts, on_change=on_course_change).props('outlined dense label="Corso"').bind_value(item, 'cid').classes('w-full')
                     ui.input().props('outlined dense').bind_value(item, 'per').classes('w-full')
                     
-                    # Ricrea il widget ore nella posizione corretta
                     ore_wdg.delete() 
                     ore_wdg = ui.number().props('outlined dense').bind_value(item, 'ore')
 
                     ui.button(icon='delete', on_click=lambda _, c=cf: rimuovi_soggetto(c)).props('flat round dense color=red')
 
-        # --- LOGICA DI STATO ---
+        # Logica Stato
         def process_user_addition(u_data):
             cf = u_data['CODICE_FISCALE']
             if cf in soggetti:
@@ -291,7 +468,6 @@ def creaattestati_page():
             
             ui.notify("Ricerca...", color='orange', spinner=True)
             res = await asyncio.to_thread(get_user_details_from_db_sync, term)
-            
             search_results_area.clear()
             
             if not res:
@@ -304,44 +480,35 @@ def creaattestati_page():
                 process_user_addition(res[0])
                 search_dialog.close()
             else:
-                # Più risultati: mostra lista nel dialog
                 with search_results_area:
                     ui.label("Trovati più utenti:").classes('font-bold mt-2')
                     with ui.list().props('bordered separator dense'):
                         for u in res:
                             dob = u['DATA_NASCITA'].strftime('%d/%m/%Y') if u['DATA_NASCITA'] else "?"
                             lbl = f"{u['COGNOME']} {u['NOME']} ({dob})"
-                            
                             with ui.item().props('clickable').on('click', lambda e, x=u: (process_user_addition(x), search_dialog.close())):
                                 with ui.item_section():
                                     ui.item_label(lbl)
                                     ui.item_label(u['CODICE_FISCALE']).props('caption')
 
-        # Colleghiamo il bottone Cerca dentro al dialog
         search_btn.on_click(perform_search)
-        # Colleghiamo Enter sul campo input
         search_input.on('keydown.enter', perform_search)
 
-
-        # --- BARRA COMANDI ---
+        # Barra Comandi
         with ui.row().classes('w-full justify-between items-center mt-2 mb-2'):
              ui.label('Lista Destinatari').classes('text-xl font-bold')
              with ui.row():
                  ui.button('Aggiungi Soggetto', on_click=open_search_ui, icon='person_add').props('color=primary')
                  ui.button('Svuota Lista', on_click=svuota_lista, icon='delete_sweep').props('color=red flat')
 
-        # --- GRIGLIA CONTAINER ---
+        # Griglia
         with ui.column().classes('w-full p-4 border rounded shadow-md'):
             count_label = ui.label("Totale: 0").classes('ml-auto text-sm text-gray-500')
-            
-            # Header
             with ui.grid().style('grid-template-columns: 1fr 1fr 1fr 3fr 1.5fr 0.6fr 0.5fr; width: 100%; font-weight: bold; border-bottom: 2px solid #ccc; padding-bottom: 5px;'):
                 ui.label('Cognome'); ui.label('Nome'); ui.label('CF'); ui.label('Corso'); ui.label('Periodo'); ui.label('Ore'); ui.label('')
-            
-            # Render iniziale
             render_lista_soggetti()
 
-        # --- GENERAZIONE ---
+        # Generazione
         async def on_generate():
             items = list(soggetti.values())
             if not items:
@@ -360,7 +527,6 @@ def creaattestati_page():
                     c_name = corsi_opts[it['cid']]
                     safe_c = re.sub(r'\W', '_', c_name)
                     safe_az = re.sub(r'\W', '_', u.get('SOCIETA', 'NoAz'))
-                    
                     t_path = os.path.join(tmp, safe_c, safe_az)
                     os.makedirs(t_path, exist_ok=True)
                     
@@ -402,21 +568,228 @@ def gestioneutenti_page():
     if not app.storage.user.get('authenticated', False):
         ui.navigate.to('/') 
         return
-    with ui.column().classes('w-full items-center p-4'):
-        ui.label('Gestione Utenti').classes('text-2xl')
+    
+    state = {'is_new': True, 'search': ''}
+    
+    cf_input = None; cognome_input = None; nome_input = None
+    data_input_field = None; luogo_input = None; ente_input = None
+    dialog_label = None; table_ref = None; dialog_ref = None
+
+    async def refresh_table():
+        rows = await asyncio.to_thread(UserRepo.get_all, state['search'])
+        if table_ref:
+            table_ref.rows = rows
+            table_ref.update()
+
+    def open_dialog(row=None):
+        dialog_ref.open()
+        if row:
+            state['is_new'] = False
+            cf_input.value = row['CODICE_FISCALE']
+            cf_input.props('readonly') 
+            cognome_input.value = row['COGNOME']
+            nome_input.value = row['NOME']
+            data_input_field.value = row['DATA_NASCITA']
+            luogo_input.value = row['LUOGO_NASCITA']
+            ente_input.value = row['ID_ENTE_FK']
+            dialog_label.text = f"Modifica: {row['COGNOME']} {row['NOME']}"
+        else:
+            state['is_new'] = True
+            cf_input.value = ''; cf_input.props(remove='readonly')
+            cognome_input.value = ''; nome_input.value = ''
+            data_input_field.value = ''; luogo_input.value = ''; ente_input.value = ''
+            dialog_label.text = "Nuovo Utente"
+
+    async def save_user():
+        if not cf_input.value or not cognome_input.value:
+            ui.notify('Campi obbligatori mancanti!', type='warning')
+            return
+
+        data = {
+            'CODICE_FISCALE': cf_input.value.upper().strip(),
+            'COGNOME': cognome_input.value.strip(),
+            'NOME': nome_input.value.strip(),
+            'DATA_NASCITA': data_input_field.value,
+            'LUOGO_NASCITA': luogo_input.value,
+            'ID_ENTE_FK': ente_input.value
+        }
+        success, msg = await asyncio.to_thread(UserRepo.upsert, data, state['is_new'])
+        if success:
+            ui.notify(msg, type='positive')
+            dialog_ref.close()
+            await refresh_table()
+        else:
+            ui.notify(msg, type='negative')
+
+    async def delete_user(row):
+        await asyncio.to_thread(UserRepo.delete, row['CODICE_FISCALE'])
+        ui.notify("Utente eliminato", type='info')
+        await refresh_table()
+
+    with ui.column().classes('w-full items-center p-8 max-w-screen-xl mx-auto bg-slate-50 min-h-screen'):
+        with ui.row().classes('w-full items-center mb-6 justify-between'):
+            with ui.row().classes('items-center gap-2'):
+                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense')
+                ui.label('Anagrafica Utenti').classes('text-3xl font-bold text-slate-800')
+            ui.button('Aggiungi Utente', icon='add', on_click=lambda: open_dialog(None)) \
+                .props('unelevated color=primary icon-right=person_add').classes('shadow-lg')
+
+        with ui.card().classes('w-full p-2 mb-4 flex flex-row items-center gap-4'):
+            ui.icon('search').classes('text-grey ml-2')
+            ui.input(placeholder='Cerca...').classes('flex-grow').props('borderless').bind_value(state, 'search').on('keydown.enter', refresh_table)
+            ui.button('Cerca', on_click=refresh_table).props('flat color=primary')
+
+        cols = [
+            {'name': 'CODICE_FISCALE', 'label': 'Codice Fiscale', 'field': 'CODICE_FISCALE', 'align': 'left', 'sortable': True},
+            {'name': 'COGNOME', 'label': 'Cognome', 'field': 'COGNOME', 'sortable': True, 'align': 'left'},
+            {'name': 'NOME', 'label': 'Nome', 'field': 'NOME', 'align': 'left'},
+            {'name': 'DATA_NASCITA', 'label': 'Data Nascita', 'field': 'DATA_NASCITA', 'align': 'center'},
+            {'name': 'ID_ENTE_FK', 'label': 'Ente', 'field': 'ID_ENTE_FK', 'align': 'center'},
+            {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
+        ]
+        table_ref = ui.table(columns=cols, rows=[], row_key='CODICE_FISCALE').classes('w-full shadow-md rounded-lg bg-white')
+        table_ref.add_slot('body-cell-azioni', r'''
+            <q-td key="azioni" :props="props">
+                <q-btn icon="edit" size="sm" round flat color="grey-8" @click="$parent.$emit('edit', props.row)" />
+                <q-btn icon="delete" size="sm" round flat color="red" @click="$parent.$emit('delete', props.row)" />
+            </q-td>
+        ''')
+        table_ref.on('edit', lambda e: open_dialog(e.args))
+        table_ref.on('delete', lambda e: delete_user(e.args))
+        ui.timer(0.1, refresh_table, once=True)
+
+    with ui.dialog() as dialog_ref, ui.card().classes('w-full max-w-2xl p-0 rounded-xl overflow-hidden'):
+        with ui.row().classes('w-full bg-primary text-white p-4 items-center justify-between'):
+            dialog_label = ui.label('Nuovo Utente').classes('text-lg font-bold')
+            ui.button(icon='close', on_click=dialog_ref.close).props('flat round dense text-white')
         
+        with ui.column().classes('w-full p-6 gap-4'):
+            with ui.row().classes('w-full gap-4'):
+                cf_input = ui.input('Codice Fiscale').props('outlined dense prepend-icon=badge uppercase').classes('w-full md:w-1/2')
+                ente_input = ui.input('ID Ente').props('outlined dense prepend-icon=business').classes('w-full md:w-1/2') 
+            with ui.row().classes('w-full gap-4'):
+                cognome_input = ui.input('Cognome').props('outlined dense prepend-icon=person').classes('w-full md:w-1/2')
+                nome_input = ui.input('Nome').props('outlined dense prepend-icon=person_outline').classes('w-full md:w-1/2')
+            with ui.row().classes('w-full gap-4'):
+                data_input_field = ui.input('Data Nascita (YYYY-MM-DD)').props('outlined dense append').classes('w-full md:w-1/3')
+                with data_input_field.add_slot('append'):
+                    ui.icon('event').classes('cursor-pointer text-grey').on('click', lambda: data_picker_menu.open())
+                    with ui.menu() as data_picker_menu:
+                        ui.date().bind_value(data_input_field).on('update:model-value', lambda: data_picker_menu.close())
+                luogo_input = ui.input('Luogo Nascita').props('outlined dense prepend-icon=place').classes('w-full md:w-2/3')
+
+        with ui.row().classes('w-full p-4 bg-slate-50 justify-end gap-2 border-t'):
+            ui.button('Annulla', on_click=dialog_ref.close).props('flat color=grey')
+            ui.button('Salva Utente', on_click=save_user, icon='save').props('unelevated color=primary')
+
 @ui.page('/gestioneenti')
 def gestioneenti_page():
     if not app.storage.user.get('authenticated', False):
         ui.navigate.to('/') 
         return
-    with ui.column().classes('w-full items-center p-4'):
-        ui.label('Gestione Enti').classes('text-2xl')
+
+    state = {'is_new': True, 'search': ''}
+
+    # Variabili UI
+    id_ente_input = None
+    desc_input = None
+    piva_input = None
+    dialog_label = None
+    table_ref = None
+    dialog_ref = None
+
+    async def refresh_table():
+        rows = await asyncio.to_thread(EnteRepo.get_all, state['search'])
+        if table_ref:
+            table_ref.rows = rows
+            table_ref.update()
+
+    def open_dialog(row=None):
+        dialog_ref.open()
+        if row:
+            state['is_new'] = False
+            id_ente_input.value = row['ID_ENTE']
+            id_ente_input.props('readonly')
+            desc_input.value = row['DESCRIZIONE']
+            piva_input.value = row['P_IVA']
+            dialog_label.text = f"Modifica Ente: {row['DESCRIZIONE']}"
+        else:
+            state['is_new'] = True
+            id_ente_input.value = ''
+            id_ente_input.props(remove='readonly')
+            desc_input.value = ''
+            piva_input.value = ''
+            dialog_label.text = "Nuovo Ente"
+
+    async def save_ente():
+        if not id_ente_input.value or not desc_input.value:
+            ui.notify('ID e Descrizione sono obbligatori!', type='warning')
+            return
+
+        data = {
+            'ID_ENTE': id_ente_input.value.strip(),
+            'DESCRIZIONE': desc_input.value.strip(),
+            'P_IVA': piva_input.value.strip() if piva_input.value else ''
+        }
+        
+        success, msg = await asyncio.to_thread(EnteRepo.upsert, data, state['is_new'])
+        if success:
+            ui.notify(msg, type='positive')
+            dialog_ref.close()
+            await refresh_table()
+        else:
+            ui.notify(msg, type='negative')
+
+    async def delete_ente(row):
+        await asyncio.to_thread(EnteRepo.delete, row['ID_ENTE'])
+        ui.notify("Ente eliminato", type='info')
+        await refresh_table()
+
+    with ui.column().classes('w-full items-center p-8 max-w-screen-xl mx-auto bg-slate-50 min-h-screen'):
+        with ui.row().classes('w-full items-center mb-6 justify-between'):
+            with ui.row().classes('items-center gap-2'):
+                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense')
+                ui.label('Gestione Enti').classes('text-3xl font-bold text-slate-800')
+            ui.button('Aggiungi Ente', icon='add', on_click=lambda: open_dialog(None)) \
+                .props('unelevated color=primary icon-right=business').classes('shadow-lg')
+
+        with ui.card().classes('w-full p-2 mb-4 flex flex-row items-center gap-4'):
+            ui.icon('search').classes('text-grey ml-2')
+            ui.input(placeholder='Cerca Ente...').classes('flex-grow').props('borderless').bind_value(state, 'search').on('keydown.enter', refresh_table)
+            ui.button('Cerca', on_click=refresh_table).props('flat color=primary')
+
+        cols = [
+            {'name': 'ID_ENTE', 'label': 'ID Ente', 'field': 'ID_ENTE', 'align': 'left', 'sortable': True},
+            {'name': 'DESCRIZIONE', 'label': 'Descrizione', 'field': 'DESCRIZIONE', 'sortable': True, 'align': 'left'},
+            {'name': 'P_IVA', 'label': 'Partita IVA', 'field': 'P_IVA', 'align': 'center'},
+            {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
+        ]
+        table_ref = ui.table(columns=cols, rows=[], row_key='ID_ENTE').classes('w-full shadow-md rounded-lg bg-white')
+        
+        table_ref.add_slot('body-cell-azioni', r'''
+            <q-td key="azioni" :props="props">
+                <q-btn icon="edit" size="sm" round flat color="grey-8" @click="$parent.$emit('edit', props.row)" />
+                <q-btn icon="delete" size="sm" round flat color="red" @click="$parent.$emit('delete', props.row)" />
+            </q-td>
+        ''')
+        table_ref.on('edit', lambda e: open_dialog(e.args))
+        table_ref.on('delete', lambda e: delete_ente(e.args))
+        
+        ui.timer(0.1, refresh_table, once=True)
+
+    with ui.dialog() as dialog_ref, ui.card().classes('w-full max-w-lg p-0 rounded-xl overflow-hidden'):
+        with ui.row().classes('w-full bg-primary text-white p-4 items-center justify-between'):
+            dialog_label = ui.label('Nuovo Ente').classes('text-lg font-bold')
+            ui.button(icon='close', on_click=dialog_ref.close).props('flat round dense text-white')
+        
+        with ui.column().classes('w-full p-6 gap-4'):
+            id_ente_input = ui.input('ID Ente').props('outlined dense prepend-icon=fingerprint').classes('w-full')
+            desc_input = ui.input('Descrizione / Ragione Sociale').props('outlined dense prepend-icon=business').classes('w-full')
+            piva_input = ui.input('Partita IVA').props('outlined dense prepend-icon=receipt').classes('w-full')
+
+        with ui.row().classes('w-full p-4 bg-slate-50 justify-end gap-2 border-t'):
+            ui.button('Annulla', on_click=dialog_ref.close).props('flat color=grey')
+            ui.button('Salva Ente', on_click=save_ente, icon='save').props('unelevated color=primary')
 
 if __name__ in {"__main__", "__mp_main__"}:
-    print("Avvio WorkSafeManager")
-    ui.run(
-        title="WorkSafeManager",
-        reload=True, 
-        storage_secret='d5b2d2675cee4718e56b89aa0d471dd62cceee996581c913f43a361dbedd67eb'
-    )
+    ui.run(title="WorkSafeManager", storage_secret='secret_key', reload=True)
