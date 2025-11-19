@@ -68,20 +68,40 @@ def get_next_session_number_sync(id_corso, data_svolgimento: date):
 # --- REPOSITORY SOGGETTI ---
 class UserRepo:
     @staticmethod
-    def get_all(search_term=''):
+    def get_all(search_term='', solo_docenti=False):
+        """
+        Recupera utenti. Se solo_docenti=True, filtra solo chi ha IS_DOCENTE=1
+        """
         conn = None
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            sql = "SELECT CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK FROM T_SOGGETTI"
+            
+            # Selezioniamo anche IS_DOCENTE
+            sql = "SELECT CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK, IS_DOCENTE FROM T_SOGGETTI"
+            
+            conditions = []
             params = []
+            
+            # Filtro Ricerca Testuale
             if search_term:
                 term = search_term.upper()
-                sql += " WHERE UPPER(COGNOME) CONTAINING ? OR UPPER(NOME) CONTAINING ? OR UPPER(CODICE_FISCALE) CONTAINING ?"
-                params = [term, term, term]
+                conditions.append("(UPPER(COGNOME) CONTAINING ? OR UPPER(NOME) CONTAINING ? OR UPPER(CODICE_FISCALE) CONTAINING ?)")
+                params.extend([term, term, term])
+            
+            # Filtro Docente
+            if solo_docenti:
+                conditions.append("IS_DOCENTE = 1")
+            
+            # Assembla la query
+            if conditions:
+                sql += " WHERE " + " AND ".join(conditions)
+            
             sql += " ORDER BY COGNOME, NOME"
+            
             cur.execute(sql, tuple(params))
             rows = cur.fetchall()
+            
             result = []
             for r in rows:
                 d_nascita = r[3]
@@ -89,9 +109,15 @@ class UserRepo:
                     d_nascita = d_nascita.strftime('%Y-%m-%d')
                 elif d_nascita is None:
                     d_nascita = ''
+                
                 result.append({
-                    'CODICE_FISCALE': r[0], 'COGNOME': r[1], 'NOME': r[2],
-                    'DATA_NASCITA': str(d_nascita), 'LUOGO_NASCITA': r[4], 'ID_ENTE_FK': r[5]
+                    'CODICE_FISCALE': r[0], 
+                    'COGNOME': r[1], 
+                    'NOME': r[2],
+                    'DATA_NASCITA': str(d_nascita), 
+                    'LUOGO_NASCITA': r[4], 
+                    'ID_ENTE_FK': r[5],
+                    'IS_DOCENTE': bool(r[6]) # Convertiamo 0/1 in True/False
                 })
             return result
         except Exception as e:
@@ -106,21 +132,43 @@ class UserRepo:
         try:
             conn = get_db_connection()
             cur = conn.cursor()
+            
+            # 1. FIX DATA NASCITA
             dt_nascita = None
-            if data['DATA_NASCITA']:
+            raw_data = str(data.get('DATA_NASCITA', '')).strip()
+            if raw_data:
                 try:
-                    if '-' in data['DATA_NASCITA']:
-                        dt_nascita = datetime.strptime(data['DATA_NASCITA'], '%Y-%m-%d').date()
-                    elif '/' in data['DATA_NASCITA']:
-                        dt_nascita = datetime.strptime(data['DATA_NASCITA'], '%d/%m/%Y').date()
+                    if '-' in raw_data:
+                        dt_nascita = datetime.strptime(raw_data, '%Y-%m-%d').date()
+                    elif '/' in raw_data:
+                        dt_nascita = datetime.strptime(raw_data, '%d/%m/%Y').date()
                 except ValueError: pass
             
+            # 2. FIX ID ENTE (QUESTO È QUELLO CHE MANCAVA)
+            # Se è vuoto, lo forziamo a None (NULL su DB)
+            id_ente_val = str(data.get('ID_ENTE_FK', '')).strip()
+            if not id_ente_val: 
+                id_ente_val = None 
+
+            # 3. GESTIONE DOCENTE
+            is_doc = 1 if data.get('IS_DOCENTE') else 0
+
             if is_new:
-                sql = "INSERT INTO T_SOGGETTI (CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK) VALUES (?, ?, ?, ?, ?, ?)"
-                params = (data['CODICE_FISCALE'], data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], data['ID_ENTE_FK'])
+                sql = """
+                    INSERT INTO T_SOGGETTI (CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK, IS_DOCENTE) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+                # Nota qui sotto: uso id_ente_val, NON data['ID_ENTE_FK']
+                params = (data['CODICE_FISCALE'], data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], id_ente_val, is_doc)
             else:
-                sql = "UPDATE T_SOGGETTI SET COGNOME=?, NOME=?, DATA_NASCITA=?, LUOGO_NASCITA=?, ID_ENTE_FK=? WHERE CODICE_FISCALE=?"
-                params = (data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], data['ID_ENTE_FK'], data['CODICE_FISCALE'])
+                sql = """
+                    UPDATE T_SOGGETTI 
+                    SET COGNOME=?, NOME=?, DATA_NASCITA=?, LUOGO_NASCITA=?, ID_ENTE_FK=?, IS_DOCENTE=? 
+                    WHERE CODICE_FISCALE=?
+                """
+                # Nota qui sotto: uso id_ente_val, NON data['ID_ENTE_FK']
+                params = (data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], id_ente_val, is_doc, data['CODICE_FISCALE'])
+            
             cur.execute(sql, params)
             conn.commit()
             return True, "Salvataggio completato."
@@ -130,9 +178,11 @@ class UserRepo:
             return False, f"Errore DB: {str(e)}"
         finally:
             if conn: conn.close()
-
+    
+    # Delete rimane uguale...
     @staticmethod
     def delete(codice_fiscale):
+        # ... (codice uguale a prima) ...
         conn = None
         try:
             conn = get_db_connection()
@@ -145,6 +195,7 @@ class UserRepo:
             if conn: conn.close()
 
 # --- REPOSITORY ENTI ---
+# --- REPOSITORY ENTI (COMPLETA) ---
 class EnteRepo:
     @staticmethod
     def get_all(search_term=''):
@@ -152,16 +203,80 @@ class EnteRepo:
         try:
             conn = get_db_connection()
             cur = conn.cursor()
+            
             sql = "SELECT ID_ENTE, DESCRIZIONE, P_IVA FROM T_ENTI"
             params = []
+            
             if search_term:
                 term = search_term.upper()
                 sql += " WHERE UPPER(DESCRIZIONE) CONTAINING ? OR UPPER(P_IVA) CONTAINING ? OR CAST(ID_ENTE AS VARCHAR(50)) CONTAINING ?"
                 params = [term, term, term]
+            
             sql += " ORDER BY DESCRIZIONE"
+            
             cur.execute(sql, tuple(params))
-            return [{'ID_ENTE': r[0], 'DESCRIZIONE': r[1], 'P_IVA': r[2]} for r in cur.fetchall()]
-        except Exception: return []
+            rows = cur.fetchall()
+            
+            # Restituisce la lista di dizionari
+            return [{'ID_ENTE': r[0], 'DESCRIZIONE': r[1], 'P_IVA': r[2]} for r in rows]
+            
+        except Exception as e:
+            print(f"Errore EnteRepo.get_all: {e}")
+            return []
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def get_next_id():
+        """Calcola il prossimo ID disponibile (MAX + 1)"""
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(ID_ENTE) FROM T_ENTI")
+            row = cur.fetchone()
+            max_id = row[0] if row and row[0] is not None else 0
+            return max_id + 1
+        except Exception as e:
+            print(f"Errore calcolo ID Ente: {e}")
+            return 1 
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def upsert(data, is_new=True):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            
+            if is_new:
+                sql = "INSERT INTO T_ENTI (ID_ENTE, DESCRIZIONE, P_IVA) VALUES (?, ?, ?)"
+                params = (data['ID_ENTE'], data['DESCRIZIONE'], data['P_IVA'])
+            else:
+                sql = "UPDATE T_ENTI SET DESCRIZIONE=?, P_IVA=? WHERE ID_ENTE=?"
+                params = (data['DESCRIZIONE'], data['P_IVA'], data['ID_ENTE'])
+            
+            cur.execute(sql, params)
+            conn.commit()
+            return True, "Salvataggio completato."
+            
+        except Exception as e:
+            return False, f"Errore DB: {str(e)}"
+        finally:
+            if conn: conn.close()
+
+    @staticmethod
+    def delete(id_ente):
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM T_ENTI WHERE ID_ENTE = ?", (id_ente,))
+            conn.commit()
+            return True
+        except Exception:
+            return False
         finally:
             if conn: conn.close()
 
@@ -262,10 +377,24 @@ def generate_certificate_sync(data_map, template_file="modello.docx", output_dir
     if not os.path.exists(template_file): raise FileNotFoundError("Template mancante")
     doc = Document(template_file)
     local_map = data_map.copy()
-    dob = local_map.get("{{DATA NASCITA}}")
-    if isinstance(dob, (datetime, date)): local_map["{{DATA NASCITA}}"] = dob.strftime('%d/%m/%Y')
     
-    # Helper per sostituzione
+    # --- FIX FORMATO DATA NASCITA ---
+    dob = local_map.get("{{DATA_NASCITA}}")
+    
+    # Caso 1: È un oggetto Data
+    if isinstance(dob, (datetime, date)): 
+        local_map["{{DATA_NASCITA}}"] = dob.strftime('%d/%m/%Y')
+    
+    # Caso 2: È una Stringa tipo "1980-05-20"
+    elif isinstance(dob, str) and '-' in dob:
+        try:
+            dt_obj = datetime.strptime(dob.strip(), '%Y-%m-%d')
+            local_map["{{DATA_NASCITA}}"] = dt_obj.strftime('%d/%m/%Y')
+        except ValueError:
+            pass 
+    # --------------------------------
+
+    # Helper per sostituzione nel Word
     def replace_in_p(p, m):
         for k, v in m.items():
             if k in p.text: p.text = p.text.replace(k, str(v if v else ''))
@@ -287,7 +416,6 @@ def generate_zip_sync(files, base, name="attestati.zip"):
     return name
 
 # --- PAGES ---
-
 @ui.page('/')
 def login_page():
     if app.storage.user.get('authenticated', False):
@@ -327,6 +455,9 @@ def dashboard_page():
         with ui.card().classes('w-64 cursor-pointer hover:shadow-xl').on('click', lambda: ui.navigate.to('/gestioneenti')):
              ui.icon('business', size='xl').classes('mx-auto text-primary')
              ui.label('Gestione Enti').classes('text-center text-lg font-bold w-full')
+        with ui.card().classes('w-64 cursor-pointer hover:shadow-xl').on('click', lambda: ui.navigate.to('/gestionedocenti')):
+             ui.icon('school', size='xl').classes('mx-auto text-primary')
+             ui.label('Gestione Docenti').classes('text-center text-lg font-bold w-full')
     def logout_click():
         app.storage.user['authenticated'] = False
         ui.navigate.to('/')
@@ -338,16 +469,17 @@ def creaattestati_page():
          ui.navigate.to('/')
          return
 
-    # --- CARICAMENTO DATI AGGIORNATO ---
+    # --- CARICAMENTO DATI ---
     corsi_raw = get_corsi_from_db_sync()
-    
-    # Mappa ID -> Nome
     corsi_opts = {c["id"]: c["nome"] for c in corsi_raw}
-    # Mappa ID -> Ore
     corsi_ore = {c["id"]: c["ore"] for c in corsi_raw}
-    # Mappa ID -> CODICE BREVE DB (Usiamo 'GEN' se vuoto)
     corsi_codici = {c["id"]: (c["codice"].strip() if c["codice"] else "GEN") for c in corsi_raw}
     
+    # --- NOVITÀ: CARICAMENTO DOCENTI ---
+    # Recuperiamo solo i docenti per popolare la select
+    docenti_list = UserRepo.get_all(solo_docenti=True)
+    docenti_opts = {d['CODICE_FISCALE']: f"{d['COGNOME']} {d['NOME']}" for d in docenti_list}
+
     soggetti = {} 
 
     # Dialogo Ricerca
@@ -370,46 +502,57 @@ def creaattestati_page():
             if not soggetti:
                 ui.label("Nessun soggetto selezionato.").classes('text-sm italic p-4 text-gray-500')
                 return
+
+            grid_style = 'grid-template-columns: 0.9fr 0.9fr 0.8fr 2fr 1.2fr 0.9fr 2fr 0.4fr 0.3fr; width: 100%; gap: 8px; align-items: center;'
             
-            # Header con colonna 'Testo Date Extra'
-            with ui.grid().style('grid-template-columns: 1fr 1fr 1fr 2.5fr 1.2fr 1.5fr 0.6fr 0.5fr; width: 100%; font-weight: bold; border-bottom: 2px solid #ccc; padding-bottom: 5px;'):
-                ui.label('Cognome'); ui.label('Nome'); ui.label('CF'); ui.label('Corso'); ui.label('Inizio (Data)'); ui.label('Note Date (Es. "e 21/11")'); ui.label('Ore'); ui.label('')
+            # Header
+            with ui.grid().style(grid_style + 'font-weight: bold; border-bottom: 2px solid #ccc; padding-bottom: 5px;'):
+                ui.label('Cognome'); ui.label('Nome'); ui.label('Codice Fiscale'); ui.label('Corso'); ui.label('Docente'); ui.label('Data Rilascio'); ui.label('Note Date'); ui.label('Ore'); ui.label('')
 
             for cf, item in soggetti.items():
                 u_data = item['user']
                 if 'date_extra' not in item: item['date_extra'] = ''
+                if 'docente_cf' not in item: item['docente_cf'] = None # Init docente
 
-                with ui.grid().style('grid-template-columns: 1fr 1fr 1fr 2.5fr 1.2fr 1.5fr 0.6fr 0.5fr; width: 100%; gap: 10px; align-items: center; border-bottom: 1px solid #eee; padding: 5px;'):
-                    ui.label(u_data['COGNOME'])
-                    ui.label(u_data['NOME'])
-                    ui.label(u_data['CODICE_FISCALE']).classes('text-xs')
+                with ui.grid().style(grid_style + 'border-bottom: 1px solid #eee; padding: 5px;'):
+                    ui.label(u_data['COGNOME']).classes('text-sm truncate')
+                    ui.label(u_data['NOME']).classes('text-sm truncate')
+                    ui.label(u_data['CODICE_FISCALE']).classes('text-xs truncate')
                     
                     def on_course_change(e, it=item):
                         it['ore'] = corsi_ore.get(e.value)
                     
-                    ui.select(options=corsi_opts, on_change=on_course_change).props('outlined dense').bind_value(item, 'cid').classes('w-full')
+                    # Select Corso
+                    ui.select(options=corsi_opts, on_change=on_course_change).props('outlined dense options-dense').bind_value(item, 'cid').classes('w-full')
                     
-                    # DATA INIZIO (Usata per conteggio sessione e nome cartella)
-                    with ui.input('Data Inizio').props('outlined dense').bind_value(item, 'per').classes('w-full') as date_inp:
+                    # --- NUOVO: SELECT DOCENTE ---
+                    ui.select(options=docenti_opts).props('outlined dense options-dense').bind_value(item, 'docente_cf').classes('w-full')
+                    
+                    # Data
+                    with ui.input().props('outlined dense').bind_value(item, 'per').classes('w-full') as date_inp:
                         with date_inp.add_slot('append'):
-                            ui.icon('event').classes('cursor-pointer').on('click', lambda: menu.open())
+                            ui.icon('event').classes('cursor-pointer text-xs').on('click', lambda: menu.open())
                             with ui.menu() as menu:
                                 ui.date().bind_value(item, 'per').on('update:model-value', lambda: menu.close())
                     
-                    # TESTO EXTRA (Usato SOLO per stampa su DOCX)
-                    ui.input(placeholder='Es: e 21/05').props('outlined dense').bind_value(item, 'date_extra').classes('w-full')
+                    # Note Extra
+                    ui.input(placeholder='Es: 28/06').props('outlined dense').bind_value(item, 'date_extra').classes('w-full')
                     
+                    # Ore
                     ui.number().props('outlined dense').bind_value(item, 'ore')
-                    ui.button(icon='delete', on_click=lambda _, c=cf: rimuovi_soggetto(c)).props('flat round dense color=red')
+                    
+                    # Delete
+                    ui.button(icon='delete', on_click=lambda _, c=cf: rimuovi_soggetto(c)).props('flat round dense color=red size=sm')
 
         def process_user_addition(u_data):
             cf = u_data['CODICE_FISCALE']
             if cf in soggetti:
                 ui.notify("Presente!", color='orange'); return
-            soggetti[cf] = {'user': u_data, 'cid': None, 'per': None, 'date_extra': '', 'ore': None}
+            # Inizializziamo anche il docente_cf a None
+            soggetti[cf] = {'user': u_data, 'cid': None, 'docente_cf': None, 'per': None, 'date_extra': '', 'ore': None}
             render_lista_soggetti.refresh()
             count_label.set_text(f"Totale: {len(soggetti)}")
-            ui.notify(f"Aggiunto: {u_data['COGNOME']} {u_data['NOME']}", color='green')
+            ui.notify(f"Aggiunto: {u_data['COGNOME']}", color='green')
 
         def rimuovi_soggetto(cf):
             if cf in soggetti: del soggetti[cf]; render_lista_soggetti.refresh(); count_label.set_text(f"Totale: {len(soggetti)}")
@@ -464,7 +607,6 @@ def creaattestati_page():
                 tmp = tempfile.mkdtemp()
                 files_to_zip = []
                 
-                # 1. Raggruppa per (Corso, DataInizio)
                 grouped_items = {}
                 for it in items:
                     raw_date = it['per']
@@ -479,23 +621,14 @@ def creaattestati_page():
                     if key not in grouped_items: grouped_items[key] = []
                     grouped_items[key].append(it)
 
-                # 2. Processa Gruppi
                 for (cid, dt_val), group_list in grouped_items.items():
-                    
-                    # A. RECUPERA CODICE DAL DB
                     codice_corso = corsi_codici.get(cid, "GEN")
-                    
-                    # B. CONTA SESSIONI (Specifico per Corso + Mese)
                     n_sessione = await asyncio.to_thread(get_next_session_number_sync, cid, dt_val)
-                    
-                    # C. FORMA NOME CARTELLA
                     data_codice = dt_val.strftime('%d%m%Y')
                     sigla_cartella = f"{n_sessione}{codice_corso}{data_codice}"
-                    
                     path_sigla = os.path.join(tmp, sigla_cartella)
                     os.makedirs(path_sigla, exist_ok=True)
                     
-                    # D. Crea Docx
                     nome_corso_full = corsi_opts[cid]
                     for it in group_list:
                         u = it['user']
@@ -503,29 +636,33 @@ def creaattestati_page():
                         final_dir = os.path.join(path_sigla, safe_az)
                         os.makedirs(final_dir, exist_ok=True)
                         
-                        # Testo Attestato
                         data_inizio_str = dt_val.strftime('%d/%m/%Y')
                         periodo_completo = f"{data_inizio_str} {it['date_extra']}" if it.get('date_extra') else data_inizio_str
+
+                        nome_docente = docenti_opts.get(it.get('docente_cf'), '')
 
                         d_map = {
                             "{{COGNOME}}": u['COGNOME'], "{{NOME}}": u['NOME'],
                             "{{CODICE}}": sigla_cartella,
+                            "{{CF}}": u['CODICE_FISCALE'],
                             "{{DATA_NASCITA}}": u['DATA_NASCITA'],
                             "{{LUOGO_NASCITA}}": u['LUOGO_NASCITA'],
                             "{{SOCIETA}}": u['SOCIETA'],
                             "{{NOME_CORSO}}": nome_corso_full,
                             "{{DATA_SVOLGIMENTO}}": periodo_completo,
                             "{{ORE_DURATA}}": it['ore'],
-                            "{{SIGLA}}": sigla_cartella
+                            "{{DATA_RILASCIOAT}}" : data_inizio_str,
+                            "{{SIGLA}}": sigla_cartella,
+                            "{{DOCENTE}}": nome_docente
                         }
                         f = await asyncio.to_thread(generate_certificate_sync, d_map, "modello.docx", final_dir)
                         files_to_zip.append(f)
                         await asyncio.to_thread(save_attestato_to_db_sync, u['CODICE_FISCALE'], cid, dt_val)
 
-                z_name = f"Export_{datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+                z_name = f"Export_{datetime.now().strftime('%d%m%Y')}.zip"
                 z_path = await asyncio.to_thread(generate_zip_sync, files_to_zip, tmp, z_name)
                 ui.download(z_path)
-                ui.notify(f"Fatto! {len(files_to_zip)} files.", color='green')
+                ui.notify(f"Attestati completati! {len(files_to_zip)} files.", color='green')
                 soggetti.clear(); render_lista_soggetti.refresh(); count_label.set_text("Totale: 0")
 
             except Exception as e:
@@ -536,41 +673,83 @@ def creaattestati_page():
                 if 'z_path' in locals() and os.path.exists(z_path): os.remove(z_path)
                 if os.path.exists(tmp): shutil.rmtree(tmp, ignore_errors=True)
 
-        ui.button("Genera e Scarica", on_click=on_generate).classes('w-full mt-6').props('color=green size=lg')
+        ui.button("Genera attestati", on_click=on_generate).classes('w-full mt-6').props('color=blue size=lg')
 
 @ui.page('/gestioneutenti')
 def gestioneutenti_page():
     if not app.storage.user.get('authenticated', False): ui.navigate.to('/'); return
+    
     state = {'is_new': True, 'search': ''}
+    
+    # Variabili UI
     cf_input = None; cognome_input = None; nome_input = None
-    data_input_field = None; luogo_input = None; ente_input = None
+    data_input_field = None; luogo_input = None; 
+    ente_select = None # <-- Rinominato per chiarezza
+    
     dialog_label = None; table_ref = None; dialog_ref = None
+
+    async def get_enti_options():
+        enti = await asyncio.to_thread(EnteRepo.get_all, '')
+        return {e['ID_ENTE']: f"{e['DESCRIZIONE']} ({e['P_IVA']})" for e in enti}
 
     async def refresh_table():
         rows = await asyncio.to_thread(UserRepo.get_all, state['search'])
+        
+        # --- MODIFICA PER DATA ITALIANA ---
+        for r in rows:
+            # Manteniamo r['DATA_NASCITA'] originale (YYYY-MM-DD) per il form di modifica
+            # Creiamo r['DATA_DISPLAY'] (DD-MM-YYYY) per la tabella
+            if r['DATA_NASCITA'] and '-' in r['DATA_NASCITA']:
+                try:
+                    anno, mese, giorno = r['DATA_NASCITA'].split('-')
+                    r['DATA_DISPLAY'] = f"{giorno}-{mese}-{anno}"
+                except:
+                    r['DATA_DISPLAY'] = r['DATA_NASCITA']
+            else:
+                r['DATA_DISPLAY'] = ''
+
         if table_ref: table_ref.rows = rows; table_ref.update()
 
-    def open_dialog(row=None):
+    async def open_dialog(row=None):
+        # 1. Carichiamo gli enti aggiornati dal DB prima di aprire
+        opzioni_enti = await get_enti_options()
+        ente_select.options = opzioni_enti
+        ente_select.update()
+
         dialog_ref.open()
+        
         if row:
             state['is_new'] = False
             cf_input.value = row['CODICE_FISCALE']; cf_input.props('readonly') 
             cognome_input.value = row['COGNOME']; nome_input.value = row['NOME']
             data_input_field.value = row['DATA_NASCITA']; luogo_input.value = row['LUOGO_NASCITA']
-            ente_input.value = row['ID_ENTE_FK']; dialog_label.text = "Modifica Utente"
+            
+            # Impostiamo l'ID dell'ente (il select mostrerà automaticamente la descrizione corrispondente)
+            ente_select.value = row['ID_ENTE_FK']
+            
+            dialog_label.text = "Modifica Utente"
         else:
             state['is_new'] = True
             cf_input.value = ''; cf_input.props(remove='readonly')
             cognome_input.value = ''; nome_input.value = ''
-            data_input_field.value = ''; luogo_input.value = ''; ente_input.value = ''
+            data_input_field.value = ''; luogo_input.value = ''; 
+            ente_select.value = None # Reset select
+            
             dialog_label.text = "Nuovo Utente"
 
     async def save_user():
         if not cf_input.value or not cognome_input.value: ui.notify('Campi mancanti!', type='warning'); return
+        
+        # Recuperiamo l'ID dal select. Se è None, passiamo stringa vuota per compatibilità con UserRepo
+        ente_val = ente_select.value if ente_select.value is not None else ''
+
         data = {
-            'CODICE_FISCALE': cf_input.value.upper().strip(), 'COGNOME': cognome_input.value.strip(),
-            'NOME': nome_input.value.strip(), 'DATA_NASCITA': data_input_field.value,
-            'LUOGO_NASCITA': luogo_input.value, 'ID_ENTE_FK': ente_input.value
+            'CODICE_FISCALE': cf_input.value.upper().strip(), 
+            'COGNOME': cognome_input.value.strip(),
+            'NOME': nome_input.value.strip(), 
+            'DATA_NASCITA': data_input_field.value,
+            'LUOGO_NASCITA': luogo_input.value, 
+            'ID_ENTE_FK': ente_val # Qui passiamo l'ID selezionato
         }
         success, msg = await asyncio.to_thread(UserRepo.upsert, data, state['is_new'])
         if success: ui.notify(msg, type='positive'); dialog_ref.close(); await refresh_table()
@@ -595,7 +774,8 @@ def gestioneutenti_page():
             {'name': 'CODICE_FISCALE', 'label': 'CF', 'field': 'CODICE_FISCALE', 'align': 'left', 'sortable': True},
             {'name': 'COGNOME', 'label': 'Cognome', 'field': 'COGNOME', 'sortable': True, 'align': 'left'},
             {'name': 'NOME', 'label': 'Nome', 'field': 'NOME', 'align': 'left'},
-            {'name': 'DATA_NASCITA', 'label': 'Data', 'field': 'DATA_NASCITA', 'align': 'center'},
+            {'name': 'DATA_NASCITA', 'label': 'Data', 'field': 'DATA_DISPLAY', 'align': 'center'},
+            {'name': 'ID_ENTE_FK', 'label': 'ID Ente', 'field': 'ID_ENTE_FK', 'align': 'center'},
             {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
         ]
         table_ref = ui.table(columns=cols, rows=[], row_key='CODICE_FISCALE').classes('w-full shadow-md bg-white')
@@ -605,7 +785,7 @@ def gestioneutenti_page():
                 <q-btn icon="delete" size="sm" round flat color="red" @click="$parent.$emit('delete', props.row)" />
             </q-td>
         ''')
-        table_ref.on('edit', lambda e: open_dialog(e.args))
+        table_ref.on('edit', lambda e: open_dialog(e.args)) # open_dialog è async, NiceGUI lo gestisce
         table_ref.on('delete', lambda e: delete_user(e.args))
         ui.timer(0.1, refresh_table, once=True)
 
@@ -613,16 +793,21 @@ def gestioneutenti_page():
         with ui.row().classes('w-full bg-primary text-white p-4 items-center justify-between'):
             dialog_label = ui.label('Utente').classes('text-lg font-bold')
             ui.button(icon='close', on_click=dialog_ref.close).props('flat round dense text-white')
+        
         with ui.column().classes('w-full p-6 gap-4'):
             with ui.row().classes('w-full gap-4'):
                 cf_input = ui.input('CF').props('outlined dense uppercase').classes('w-full md:w-1/2')
-                ente_input = ui.input('ID Ente').props('outlined dense').classes('w-full md:w-1/2') 
+                ente_select = ui.select(options={}, with_input=True, label='Seleziona Ente') \
+                    .props('outlined dense use-input input-debounce="0" behavior="menu"') \
+                    .classes('w-full md:w-1/2')
+
             with ui.row().classes('w-full gap-4'):
                 cognome_input = ui.input('Cognome').props('outlined dense').classes('w-full md:w-1/2')
                 nome_input = ui.input('Nome').props('outlined dense').classes('w-full md:w-1/2')
             with ui.row().classes('w-full gap-4'):
-                data_input_field = ui.input('Data (YYYY-MM-DD)').props('outlined dense').classes('w-full md:w-1/3')
+                data_input_field = ui.input('Data').props('outlined dense').classes('w-full md:w-1/3')
                 luogo_input = ui.input('Luogo Nascita').props('outlined dense').classes('w-full md:w-2/3')
+            
             ui.button('Salva', on_click=save_user).props('unelevated color=primary w-full')
 
 @ui.page('/gestioneenti')
@@ -640,8 +825,11 @@ def gestioneenti_page():
         dialog_ref.open()
         if row:
             state['is_new'] = False
-            id_ente_input.value = row['ID_ENTE']; id_ente_input.props('readonly')
-            desc_input.value = row['DESCRIZIONE']; piva_input.value = row['P_IVA']
+            # Carichiamo i valori. NiceGUI accetta int negli input, ma dobbiamo ricordarci che sono int.
+            id_ente_input.value = row['ID_ENTE']
+            id_ente_input.props('readonly')
+            desc_input.value = row['DESCRIZIONE']
+            piva_input.value = row['P_IVA']
             dialog_label.text = "Modifica Ente"
         else:
             state['is_new'] = True
@@ -649,11 +837,33 @@ def gestioneenti_page():
             desc_input.value = ''; piva_input.value = ''; dialog_label.text = "Nuovo Ente"
 
     async def save_ente():
-        if not id_ente_input.value or not desc_input.value: ui.notify('Dati mancanti!', type='warning'); return
-        data = {'ID_ENTE': id_ente_input.value.strip(), 'DESCRIZIONE': desc_input.value.strip(), 'P_IVA': piva_input.value.strip()}
+        # Controllo validità
+        if not id_ente_input.value or not desc_input.value: 
+            ui.notify('Dati mancanti!', type='warning')
+            return
+        
+        # --- MODIFICA QUI: Convertiamo in stringa (str) prima di fare strip() ---
+        # Questo evita l'errore se il valore è un numero (int)
+        id_val = str(id_ente_input.value).strip()
+        desc_val = str(desc_input.value).strip()
+        
+        # Per la P.IVA gestiamo anche il caso che sia vuota/None
+        piva_val = str(piva_input.value).strip() if piva_input.value else ''
+
+        data = {
+            'ID_ENTE': id_val, 
+            'DESCRIZIONE': desc_val, 
+            'P_IVA': piva_val
+        }
+        # -----------------------------------------------------------------------
+
         success, msg = await asyncio.to_thread(EnteRepo.upsert, data, state['is_new'])
-        if success: ui.notify(msg, type='positive'); dialog_ref.close(); await refresh_table()
-        else: ui.notify(msg, type='negative')
+        if success: 
+            ui.notify(msg, type='positive')
+            dialog_ref.close()
+            await refresh_table()
+        else: 
+            ui.notify(msg, type='negative')
 
     async def delete_ente(row):
         await asyncio.to_thread(EnteRepo.delete, row['ID_ENTE'])
@@ -696,6 +906,107 @@ def gestioneenti_page():
             desc_input = ui.input('Ragione Sociale').props('outlined dense').classes('w-full')
             piva_input = ui.input('P.IVA').props('outlined dense').classes('w-full')
             ui.button('Salva', on_click=save_ente).props('unelevated color=primary w-full')
+            
+@ui.page('/gestionedocenti')
+def gestionedocenti_page():
+    ui.label('So un coglionazzo')
+    # -- PROVA -- 
+    if not app.storage.user.get('authenticated', False): ui.navigate.to('/'); return
+    state = {'is_new': True, 'search': ''}
+    # Variabili UI
+    cf_input = None; cognome_input = None; nome_input = None
+    data_input_field = None; luogo_input = None; ente_input = None
+    dialog_ref = None; table_ref = None; dialog_label = None
+
+    async def refresh_table():
+        # --- QUI LA DIFFERENZA: solo_docenti=True ---
+        rows = await asyncio.to_thread(UserRepo.get_all, state['search'], solo_docenti=True)
+        if table_ref: table_ref.rows = rows; table_ref.update()
+
+    def open_dialog(row=None):
+        dialog_ref.open()
+        if row:
+            state['is_new'] = False
+            cf_input.value = row['CODICE_FISCALE']; cf_input.props('readonly') 
+            cognome_input.value = row['COGNOME']; nome_input.value = row['NOME']
+            data_input_field.value = row['DATA_NASCITA']; luogo_input.value = row['LUOGO_NASCITA']
+            ente_input.value = row['ID_ENTE_FK']
+            dialog_label.text = "Modifica Docente"
+        else:
+            state['is_new'] = True
+            cf_input.value = ''; cf_input.props(remove='readonly')
+            cognome_input.value = ''; nome_input.value = ''
+            data_input_field.value = ''; luogo_input.value = ''; ente_input.value = ''
+            dialog_label.text = "Nuovo Docente"
+
+    async def save_docente():
+        if not cf_input.value or not cognome_input.value: ui.notify('Dati mancanti!', type='warning'); return
+        
+        data = {
+            'CODICE_FISCALE': cf_input.value.upper().strip(),
+            'COGNOME': cognome_input.value.strip(),
+            'NOME': nome_input.value.strip(),
+            'DATA_NASCITA': data_input_field.value,
+            'LUOGO_NASCITA': luogo_input.value,
+            'ID_ENTE_FK': ente_input.value,
+            'IS_DOCENTE': True  # --- FORZIAMO CHE SIA UN DOCENTE ---
+        }
+        
+        success, msg = await asyncio.to_thread(UserRepo.upsert, data, state['is_new'])
+        if success: ui.notify(msg, type='positive'); dialog_ref.close(); await refresh_table()
+        else: ui.notify(msg, type='negative')
+
+    async def delete_docente(row):
+        await asyncio.to_thread(UserRepo.delete, row['CODICE_FISCALE'])
+        ui.notify("Eliminato", type='info'); await refresh_table()
+
+    # --- UI IDENTICA A GESTIONE UTENTI MA TITOLI DIVERSI ---
+    with ui.column().classes('w-full items-center p-8 max-w-screen-xl mx-auto bg-slate-50 min-h-screen'):
+        with ui.row().classes('w-full items-center mb-6 justify-between'):
+            ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense')
+            ui.label('Gestione Docenti').classes('text-3xl font-bold text-slate-800')
+            ui.button('Nuovo Docente', icon='add', on_click=lambda: open_dialog(None)).props('unelevated color=primary')
+
+        # ... SEARCH BAR ...
+        with ui.card().classes('w-full p-2 mb-4 flex flex-row items-center gap-4'):
+            ui.icon('search').classes('text-grey ml-2')
+            ui.input(placeholder='Cerca Docente...').classes('flex-grow').props('borderless').bind_value(state, 'search').on('keydown.enter', refresh_table)
+            ui.button('Cerca', on_click=refresh_table).props('flat color=primary')
+
+        # ... TABLE ...
+        cols = [
+            {'name': 'CODICE_FISCALE', 'label': 'CF', 'field': 'CODICE_FISCALE', 'align': 'left', 'sortable': True},
+            {'name': 'COGNOME', 'label': 'Cognome', 'field': 'COGNOME', 'sortable': True, 'align': 'left'},
+            {'name': 'NOME', 'label': 'Nome', 'field': 'NOME', 'align': 'left'},
+            {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
+        ]
+        table_ref = ui.table(columns=cols, rows=[], row_key='CODICE_FISCALE').classes('w-full shadow-md bg-white')
+        table_ref.add_slot('body-cell-azioni', r'''
+            <q-td key="azioni" :props="props">
+                <q-btn icon="edit" size="sm" round flat color="grey-8" @click="$parent.$emit('edit', props.row)" />
+                <q-btn icon="delete" size="sm" round flat color="red" @click="$parent.$emit('delete', props.row)" />
+            </q-td>
+        ''')
+        table_ref.on('edit', lambda e: open_dialog(e.args))
+        table_ref.on('delete', lambda e: delete_docente(e.args))
+        ui.timer(0.1, refresh_table, once=True)
+
+    # --- DIALOGO (Identico a Gestione Utenti) ---
+    with ui.dialog() as dialog_ref, ui.card().classes('w-full max-w-2xl p-0 rounded-xl overflow-hidden'):
+        with ui.row().classes('w-full bg-primary text-white p-4 items-center justify-between'):
+            dialog_label = ui.label('Docente').classes('text-lg font-bold')
+            ui.button(icon='close', on_click=dialog_ref.close).props('flat round dense text-white')
+        with ui.column().classes('w-full p-6 gap-4'):
+            with ui.row().classes('w-full gap-4'):
+                cf_input = ui.input('CF').props('outlined dense uppercase').classes('w-full md:w-1/2')
+                ente_input = ui.input('ID Ente (Opzionale)').props('outlined dense').classes('w-full md:w-1/2') 
+            with ui.row().classes('w-full gap-4'):
+                cognome_input = ui.input('Cognome').props('outlined dense').classes('w-full md:w-1/2')
+                nome_input = ui.input('Nome').props('outlined dense').classes('w-full md:w-1/2')
+            with ui.row().classes('w-full gap-4'):
+                data_input_field = ui.input('Data Nascita').props('outlined dense').classes('w-full md:w-1/3')
+                luogo_input = ui.input('Luogo Nascita').props('outlined dense').classes('w-full md:w-2/3')
+            ui.button('Salva Docente', on_click=save_docente).props('unelevated color=primary w-full')
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(title="WorkSafeManager", storage_secret='secret_key', reload=True)
