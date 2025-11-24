@@ -1,0 +1,7 @@
+{
+    "host": "localhost",
+    "database": "DBSYSTE",
+    "user": "postgres",
+    "password": "masterkey",
+    "port": 5432
+}
