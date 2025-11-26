@@ -1,5 +1,5 @@
 {
-    "host": "localhost",
+    "host": "51.21.226.0",
     "database": "DBSYSTE",
     "user": "postgres",
     "password": "masterkey",

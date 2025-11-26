@@ -1,0 +1,51 @@
+2025-11-26 15:26:40,832 - INFO - WorkSafeManager avviato!
+2025-11-26 15:26:41,185 - INFO - Connessione a PostgresSQL riuscita
+2025-11-26 15:26:43,653 - INFO - WorkSafeManager avviato!
+2025-11-26 15:26:43,714 - INFO - 1 change detected
+2025-11-26 15:26:48,222 - INFO - 1 change detected
+2025-11-26 15:26:58,828 - ERROR - ERRORE STRUTTURA UPLOAD. Tipo: <class 'nicegui.events.UploadEventArguments'>. Contenuto: ['__annotate_func__', '__annotations__', '__annotations_cache__', '__class__', '__dataclass_fields__', '__dataclass_params__', '__delattr__', '__dir__', '__doc__', '__eq__', '__firstlineno__', '__format__', '__ge__', '__getattribute__', '__getstate__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__match_args__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__replace__', '__repr__', '__setattr__', '__sizeof__', '__slots__', '__static_attributes__', '__str__', '__subclasshook__', 'client', 'file', 'sender']
+2025-11-26 15:27:07,792 - INFO - 1 change detected
+2025-11-26 15:27:08,183 - INFO - 1 change detected
+2025-11-26 15:27:08,749 - INFO - 1 change detected
+2025-11-26 15:27:09,116 - INFO - 1 change detected
+2025-11-26 15:29:14,836 - INFO - 1 change detected
+2025-11-26 15:29:21,508 - INFO - WorkSafeManager avviato!
+2025-11-26 15:29:21,927 - INFO - Connessione a PostgresSQL riuscita
+2025-11-26 15:29:24,366 - INFO - WorkSafeManager avviato!
+2025-11-26 15:29:24,434 - INFO - 1 change detected
+2025-11-26 15:29:24,994 - INFO - 1 change detected
+2025-11-26 15:29:31,868 - ERROR - Errore upload modello: a bytes-like object is required, not 'coroutine'
+Traceback (most recent call last):
+  File "c:\Users\lricci\Desktop\Github\WorkSafeManager\main_mod_postgres.py", line 930, in handle_template_upload
+    f.write(data)
+    ~~~~~~~^^^^^^
+TypeError: a bytes-like object is required, not 'coroutine'
+2025-11-26 15:29:35,215 - INFO - 1 change detected
+2025-11-26 15:29:35,570 - INFO - 1 change detected
+2025-11-26 15:30:49,651 - INFO - 1 change detected
+2025-11-26 15:32:33,448 - INFO - WorkSafeManager avviato!
+2025-11-26 15:32:33,828 - INFO - Connessione a PostgresSQL riuscita
+2025-11-26 15:32:36,027 - INFO - WorkSafeManager avviato!
+2025-11-26 15:32:36,128 - INFO - 1 change detected
+2025-11-26 15:32:36,797 - INFO - 1 change detected
+2025-11-26 15:32:44,271 - INFO - Nuovo modello caricato: modello_prova.docx
+2025-11-26 15:33:33,584 - INFO - 1 change detected
+2025-11-26 15:33:33,961 - INFO - 1 change detected
+2025-11-26 15:33:34,332 - INFO - 1 change detected
+2025-11-26 15:36:54,773 - INFO - 1 change detected
+2025-11-26 15:36:55,133 - INFO - 1 change detected
+2025-11-26 15:37:45,520 - INFO - WorkSafeManager avviato!
+2025-11-26 15:37:45,891 - INFO - Connessione a PostgresSQL riuscita
+2025-11-26 15:37:48,229 - INFO - WorkSafeManager avviato!
+2025-11-26 15:37:48,305 - INFO - 1 change detected
+2025-11-26 15:37:49,289 - INFO - 1 change detected
+2025-11-26 15:37:55,848 - INFO - --- INIZIO UPLOAD ---
+2025-11-26 15:37:55,849 - INFO - Target Path calcolato: '/home/ubuntu/app/WorkSafeManager/templates\sconosciuto.docx'
+2025-11-26 15:37:55,849 - INFO - Dati letti dalla memoria: 67337 bytes
+2025-11-26 15:37:55,854 - INFO - VERIFICA SUCCESS: Il file esiste sul disco! Dimensione: 67337 bytes. Proprietario ID: 0
+2025-11-26 15:38:09,785 - INFO - 1 change detected
+2025-11-26 15:38:10,147 - INFO - 1 change detected
+2025-11-26 15:40:28,446 - INFO - --- INIZIO UPLOAD ---
+2025-11-26 15:40:28,446 - INFO - Target Path calcolato: '/home/ubuntu/app/WorkSafeManager/templates\sconosciuto.docx'
+2025-11-26 15:40:28,497 - INFO - Dati letti dalla memoria: 67337 bytes
+2025-11-26 15:40:28,501 - INFO - VERIFICA SUCCESS: Il file esiste sul disco! Dimensione: 67337 bytes. Proprietario ID: 0
