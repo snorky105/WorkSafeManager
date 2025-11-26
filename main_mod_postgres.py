@@ -866,69 +866,65 @@ def gestionecorsi_page():
         return [f for f in os.listdir(ABSOLUTE_PATH_TO_TEMPLATES) if f.endswith('.docx') and not f.startswith('~$')]
 
     async def handle_template_upload(e):
-        """Gestisce l'upload con LOGGING ESTREMO per trovare il file fantasma"""
+        """Gestisce l'upload recuperando correttamente il nome file"""
         
-        # 1. LOG nome file grezzo
-        logger.info(f"--- INIZIO UPLOAD ---")
+        # --- 1. RECUPERO NOME FILE (CORRETTO) ---
+        # Accediamo direttamente a e.name. NiceGUI garantisce che esista.
+        original_filename = e.name
         
-        original_filename = "sconosciuto.docx"
-        if hasattr(e, 'name'): original_filename = e.name
-        elif isinstance(e, dict) and 'name' in e: original_filename = e['name']
+        # Sicurezza extra: se per miracolo fosse vuoto
+        if not original_filename:
+            original_filename = "documento_senza_nome.docx"
+            
+        logger.info(f"--- INIZIO UPLOAD: {original_filename} ---")
         
-        # Pulisci il nome file da spazi o caratteri strani per sicurezza
-        original_filename = original_filename.strip()
+        # Pulisci il nome file da percorsi assoluti (es. C:\fakepath\...) o caratteri strani
+        original_filename = os.path.basename(original_filename)
         
-        # 2. LOG percorso target
+        # --- 2. PERCORSO TARGET ---
         target_path = os.path.join(ABSOLUTE_PATH_TO_TEMPLATES, original_filename)
-        logger.info(f"Target Path calcolato: '{target_path}'")
+        logger.info(f"Salvataggio in: '{target_path}'")
 
-        # Creazione cartella
+        # Creazione cartella se non esiste
         try:
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
         except Exception as create_err:
             logger.error(f"Errore creazione cartella: {create_err}")
+            ui.notify("Errore accesso cartella server", color='red')
             return
 
-        # 3. Lettura e Scrittura
+        # --- 3. SCRITTURA FILE ---
         try:
-            content_to_write = None
-            if hasattr(e, 'content'): content_to_write = e.content
-            elif hasattr(e, 'file'): content_to_write = e.file
+            # Recupera il contenuto binario
+            content_to_write = e.content
             
-            if not content_to_write:
-                logger.error("STREAM VUOTO: content_to_write è None")
-                return
-
-            if hasattr(content_to_write, 'seek'): content_to_write.seek(0)
+            # Reset del puntatore (importante per file riutilizzati)
+            if hasattr(content_to_write, 'seek'): 
+                content_to_write.seek(0)
 
             # Lettura dati
             read_result = content_to_write.read()
+            # Gestione asincrona se necessario
             if asyncio.iscoroutine(read_result):
                 data = await read_result
             else:
                 data = read_result
             
-            # 4. LOG dimensione dati
-            size_bytes = len(data)
-            logger.info(f"Dati letti dalla memoria: {size_bytes} bytes")
-            
-            if size_bytes == 0:
-                logger.warning("ATTENZIONE: Sto scrivendo un file di 0 bytes!")
-
             # Scrittura su disco
             with open(target_path, 'wb') as f:
                 f.write(data)
-                f.flush()             # Forza la scrittura dal buffer al sistema
-                os.fsync(f.fileno())  # Forza la scrittura dal sistema al disco fisico
             
-            # 5. VERIFICA IMMEDIATA ESISTENZA
-            if os.path.exists(target_path):
-                stats = os.stat(target_path)
-                logger.info(f"VERIFICA SUCCESS: Il file esiste sul disco! Dimensione: {stats.st_size} bytes. Proprietario ID: {stats.st_uid}")
-                ui.notify(f"File salvato in: {target_path}", color='green')
-            else:
-                logger.error(f"VERIFICA FAILED: Python ha finito di scrivere ma il file NON c'è in {target_path}!")
-                ui.notify("Errore fantasma: file non trovato dopo scrittura", color='red')
+            # Notifica successo
+            ui.notify(f"Caricato: {original_filename}", color='green')
+            
+            # Aggiorna la select nel dialog se è aperto
+            if dialog_ref.value: # Se il dialog è visibile
+                 # Aggiorna le opzioni della select "template_select"
+                 # Nota: dobbiamo richiamare la logica per ricaricare i file
+                 files_disponibili = get_template_files()
+                 if template_select:
+                     template_select.options = files_disponibili
+                     template_select.update()
 
         except Exception as err:
             ui.notify(f"Errore salvataggio: {err}", color='red')
