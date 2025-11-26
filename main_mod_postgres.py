@@ -866,69 +866,95 @@ def gestionecorsi_page():
         return [f for f in os.listdir(ABSOLUTE_PATH_TO_TEMPLATES) if f.endswith('.docx') and not f.startswith('~$')]
 
     async def handle_template_upload(e):
-        """Gestisce l'upload recuperando correttamente il nome file"""
+        """
+        Gestione robusta dell'upload che previene il crash AttributeError
+        e cerca il nome del file in attributi alternativi.
+        """
+        logger.info("--- START UPLOAD HANDLER ---")
         
-        # --- 1. RECUPERO NOME FILE (CORRETTO) ---
-        # Accediamo direttamente a e.name. NiceGUI garantisce che esista.
-        original_filename = e.name
+        # 1. TENTATIVO RECUPERO NOME FILE
+        original_filename = "sconosciuto.docx" # Default sicuro
         
-        # Sicurezza extra: se per miracolo fosse vuoto
+        try:
+            # Metodo Standard
+            if hasattr(e, 'name'):
+                original_filename = e.name
+            # Metodo Alternativo (alcune versioni usano filename)
+            elif hasattr(e, 'filename'):
+                original_filename = e.filename
+            # Metodo Dizionario (se e.args esiste)
+            elif hasattr(e, 'args') and isinstance(e.args, dict) and 'name' in e.args:
+                original_filename = e.args['name']
+            # Metodo Contenuto (a volte il file object ha il nome)
+            elif hasattr(e, 'content') and hasattr(e.content, 'name'):
+                # Attenzione: questo potrebbe restituire un path temporaneo tipo /tmp/tmp123
+                original_filename = os.path.basename(e.content.name)
+            else:
+                # SE TUTTO FALLISCE: ISPEZIONIAMO L'OGGETTO NEL LOG
+                logger.error("IMPOSSIBILE TROVARE IL NOME DEL FILE!")
+                logger.error(f"Attributi disponibili in 'e': {dir(e)}")
+                if hasattr(e, '__dict__'):
+                     logger.error(f"Contenuto __dict__: {e.__dict__}")
+
+        except Exception as ex:
+            logger.error(f"Errore durante l'estrazione del nome file: {ex}")
+
+        # Se ancora non abbiamo un nome valido o è vuoto
         if not original_filename:
-            original_filename = "documento_senza_nome.docx"
-            
-        logger.info(f"--- INIZIO UPLOAD: {original_filename} ---")
+            original_filename = f"upload_{int(datetime.now().timestamp())}.docx"
+
+        # Pulisci il nome file (basename per sicurezza)
+        original_filename = os.path.basename(str(original_filename))
         
-        # Pulisci il nome file da percorsi assoluti (es. C:\fakepath\...) o caratteri strani
-        original_filename = os.path.basename(original_filename)
-        
+        logger.info(f"Nome file rilevato: {original_filename}")
+
         # --- 2. PERCORSO TARGET ---
         target_path = os.path.join(ABSOLUTE_PATH_TO_TEMPLATES, original_filename)
-        logger.info(f"Salvataggio in: '{target_path}'")
-
-        # Creazione cartella se non esiste
+        
+        # Creazione cartella
         try:
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
         except Exception as create_err:
             logger.error(f"Errore creazione cartella: {create_err}")
-            ui.notify("Errore accesso cartella server", color='red')
+            ui.notify("Errore accesso disco", color='red')
             return
 
         # --- 3. SCRITTURA FILE ---
         try:
-            # Recupera il contenuto binario
             content_to_write = e.content
             
-            # Reset del puntatore (importante per file riutilizzati)
+            # Se content è None, abortiamo
+            if not content_to_write:
+                ui.notify("Errore: contenuto file vuoto", color='red')
+                return
+
             if hasattr(content_to_write, 'seek'): 
                 content_to_write.seek(0)
 
-            # Lettura dati
             read_result = content_to_write.read()
-            # Gestione asincrona se necessario
+            
             if asyncio.iscoroutine(read_result):
                 data = await read_result
             else:
                 data = read_result
             
-            # Scrittura su disco
             with open(target_path, 'wb') as f:
                 f.write(data)
             
-            # Notifica successo
             ui.notify(f"Caricato: {original_filename}", color='green')
             
-            # Aggiorna la select nel dialog se è aperto
-            if dialog_ref.value: # Se il dialog è visibile
-                 # Aggiorna le opzioni della select "template_select"
-                 # Nota: dobbiamo richiamare la logica per ricaricare i file
-                 files_disponibili = get_template_files()
-                 if template_select:
-                     template_select.options = files_disponibili
-                     template_select.update()
+            # Aggiorna la select se il dialog è aperto
+            files_disponibili = get_template_files()
+            if template_select:
+                template_select.options = files_disponibili
+                template_select.update()
+                # Se abbiamo appena caricato un file, autoselezionalo
+                if original_filename in files_disponibili:
+                    template_select.value = original_filename
 
         except Exception as err:
-            ui.notify(f"Errore salvataggio: {err}", color='red')
-            logger.error(f"Eccezione durante scrittura: {err}", exc_info=True)
+            ui.notify(f"Errore scrittura: {str(err)}", color='red')
+            logger.error(f"Eccezione scrittura: {err}", exc_info=True)
 
     # --- 3. LOGICA OPERATIVA (CRUD) ---
 
