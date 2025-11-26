@@ -49,3 +49,6 @@ TypeError: a bytes-like object is required, not 'coroutine'
 2025-11-26 15:40:28,446 - INFO - Target Path calcolato: '/home/ubuntu/app/WorkSafeManager/templates\sconosciuto.docx'
 2025-11-26 15:40:28,497 - INFO - Dati letti dalla memoria: 67337 bytes
 2025-11-26 15:40:28,501 - INFO - VERIFICA SUCCESS: Il file esiste sul disco! Dimensione: 67337 bytes. Proprietario ID: 0
+2025-11-26 16:42:37,245 - INFO - WorkSafeManager avviato!
+2025-11-26 16:42:37,642 - INFO - Connessione a PostgresSQL riuscita
+2025-11-26 16:42:39,948 - INFO - WorkSafeManager avviato!
