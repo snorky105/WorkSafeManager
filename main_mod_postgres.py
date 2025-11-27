@@ -1078,6 +1078,53 @@ def gestionecorsi_page():
         if table_ref: 
             table_ref.rows = rows
             table_ref.update()
+            
+    def open_confirm_delete(row):
+        # Salviamo la riga che vogliamo cancellare nello "state"
+        state['row_to_delete'] = row
+        # Apriamo il dialog che chiede "Sei sicuro?"
+        confirm_dialog.open()
+        
+    async def save_corso():
+        # 1. Validazione dati obbligatori
+        if not nome_input.value: 
+            ui.notify('Il Nome del corso è obbligatorio!', type='warning')
+            return
+            
+        # 2. Conversione sicura dei numeri
+        try:
+            ore_val = float(ore_input.value) if ore_input.value else 0
+            validita_val = int(validita_input.value) if validita_input.value else 5
+        except ValueError:
+            ui.notify('Errore nei valori numerici (Ore o Validità)', type='warning')
+            return
+        
+        if ore_val <= 0:
+            ui.notify('La durata deve essere maggiore di 0', type='warning')
+            return
+
+        # 3. Preparazione del dizionario dati
+        data = {
+            'ID_CORSO': int(id_input.value),
+            'NOME_CORSO': nome_input.value.strip(),
+            'ORE_DURATA': ore_val,
+            'VALIDITA_ANNI': validita_val, 
+            'CODICE_BREVE': codice_input.value.strip() if codice_input.value else '',
+            'PROGRAMMA': programma_input.value.strip() if programma_input.value else '',
+            'TEMPLATE_FILE': template_select.value
+        }
+        
+        # 4. Chiamata al Database (Upsert: Insert o Update)
+        # Nota: Assumiamo che CorsoRepo.upsert accetti (dati, is_new)
+        success, msg = await asyncio.to_thread(CorsoRepo.upsert, data, state['is_new'])
+        
+        # 5. Gestione esito
+        if success:
+            ui.notify(msg, type='positive')
+            dialog_ref.close()    # Chiude il popup
+            await refresh_table() # Ricarica la tabella
+        else:
+            ui.notify(f"Errore salvataggio: {msg}", type='negative')
 
     async def open_dialog(row=None):
         files_disponibili = get_template_files()
@@ -1115,53 +1162,50 @@ def gestionecorsi_page():
             programma_input.value = ''
             template_select.value = None
 
-    async def save_corso():
-        if not nome_input.value: 
-            ui.notify('Nome corso obbligatorio!', type='warning')
-            return
-            
-        ore_val = float(ore_input.value) if ore_input.value else 0
-        validita_val = int(validita_input.value) if validita_input.value else 5
-        
-        if ore_val <= 0:
-            ui.notify('Durata ore non valida', type='warning')
-            return
-
-        data = {
-            'ID_CORSO': int(id_input.value),
-            'NOME_CORSO': nome_input.value.strip(),
-            'ORE_DURATA': ore_val,
-            'VALIDITA_ANNI': validita_val, # <--- SALVIAMO IL DATO
-            'CODICE_BREVE': codice_input.value.strip() if codice_input.value else '',
-            'PROGRAMMA': programma_input.value.strip() if programma_input.value else '',
-            'TEMPLATE_FILE': template_select.value
-        }
-        
-        success, msg = await asyncio.to_thread(CorsoRepo.upsert, data, state['is_new'])
-        
-        if success:
-            ui.notify(msg, type='positive')
-            dialog_ref.close()
-            await refresh_table()
-        else:
-            ui.notify(msg, type='negative')
-
-    # Delete logic
-    def open_confirm_delete(row):
-        state['row_to_delete'] = row
-        confirm_dialog.open()
-
     async def execute_delete():
-        if not state['row_to_delete']: return
+        # 1. Controllo difensivo se lo stato è vuoto
+        if not state['row_to_delete']: 
+            return
+
         row = state['row_to_delete']
-        success, msg = await asyncio.to_thread(CorsoRepo.delete, row['ID_CORSO'])
-        if success:
-            ui.notify(msg, type='positive')
-            await refresh_table()
+        
+        # 2. Estrazione sicura dell'ID (gestisce sia dict che oggetti)
+        if isinstance(row, dict):
+            corso_id = row.get('ID_CORSO')
         else:
-            ui.notify(msg, type='negative')
-        confirm_dialog.close()
-        state['row_to_delete'] = None
+            corso_id = getattr(row, 'ID_CORSO', None)
+
+        if corso_id is None:
+            ui.notify("Errore: ID corso non trovato", type='negative')
+            return
+
+        try:
+            # 3. Tentativo di cancellazione
+            success, msg = await asyncio.to_thread(CorsoRepo.delete, corso_id)
+            
+            if success:
+                ui.notify(msg, type='positive')
+                confirm_dialog.close()
+                state['row_to_delete'] = None
+                await refresh_table()
+            else:
+                # 4. GESTIONE SPECIFICA ERRORI (Attestati collegati)
+                msg_str = str(msg).lower()
+                if "foreign key" in msg_str or "t_attestati" in msg_str:
+                    ui.notify("Impossibile eliminare: ci sono Attestati emessi per questo corso.", type='warning', timeout=5000)
+                    # NON chiudiamo il dialog per dare tempo di leggere
+                else:
+                    ui.notify(f"Errore DB: {msg}", type='negative')
+
+        except Exception as e:
+            # 5. Gestione eccezioni impreviste (es. DB disconnesso)
+            err_msg = str(e).lower()
+            if "foreign key" in err_msg:
+                ui.notify("Impossibile eliminare: ci sono Attestati collegati!", type='warning', timeout=5000)
+            else:
+                import traceback
+                traceback.print_exc()
+                ui.notify(f"Errore di sistema: {e}", type='negative')
 
     # --- LAYOUT ---
     with ui.column().classes('w-full items-center p-8 bg-slate-50 min-h-screen'):
@@ -1973,7 +2017,7 @@ def gestioneutenti_page():
             
             # Riga 1: CF e Docente
             with ui.row().classes('w-full gap-4 items-center'):
-                cf_input = ui.input('Codice Fiscale *').props('outlined dense uppercase mask="AAAAAAAAAAAAAAAA"').classes('w-full md:w-1/2')
+                cf_input = ui.input('Codice Fiscale *').props('outlined dense uppercase maxlength=16').classes('w-full md:w-1/2')
                 is_docente_check = ui.checkbox('Abilita come Docente').classes('text-purple-600 font-bold')
 
             # Riga 2: Anagrafica
@@ -2218,7 +2262,7 @@ def gestionedocenti_page():
             ui.button(icon='close', on_click=dialog_ref.close).props('flat round dense text-white')
         with ui.column().classes('w-full p-6 gap-4'):
             with ui.row().classes('w-full gap-4'):
-                cf_input = ui.input('CF').props('outlined dense uppercase').classes('w-full md:w-1/2')
+                cf_input = ui.input('Codice Fiscale *').props('outlined dense uppercase maxlength=16').classes('w-full md:w-1/2')
                 ente_input = ui.input('ID Ente (Opzionale)').props('outlined dense').classes('w-full md:w-1/2') 
             with ui.row().classes('w-full gap-4'):
                 cognome_input = ui.input('Cognome').props('outlined dense').classes('w-full md:w-1/2')
