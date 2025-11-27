@@ -6,12 +6,16 @@ import asyncio
 from nicegui import ui, app, run
 import os
 from docx import Document
-from datetime import datetime, date
+from datetime import datetime, date , timedelta
 import tempfile
 import shutil
 import zipfile
 import re
 import logging
+import csv
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 #-- LOGGING --
 logging.basicConfig(
@@ -222,6 +226,114 @@ class UserRepo:
         finally:
             if conn: conn.close()
 
+# --- REPOSITORY ATTESTATI ---
+class AttestatiRepo:
+    @staticmethod
+    def get_history(search='', start_date=None, end_date=None):
+        """
+        Recupera lo storico unendo t_attestati, t_soggetti e t_corsi.
+        """
+        conn = None
+        results = []
+        try:
+            # Usa la tua funzione di connessione che è già in questo file
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # QUERY CORRETTA PER LA TUA TABELLA t_attestati
+            query = """
+                SELECT 
+                    a.id_attestato,
+                    a.data_svolgimento,
+                    s.codice_fiscale,
+                    s.cognome,
+                    s.nome,
+                    c.nome_corso
+                FROM public.t_attestati a
+                JOIN public.t_soggetti s ON a.id_soggetto_fk = s.codice_fiscale
+                JOIN public.t_corsi c ON a.id_corso_fk = c.id_corso
+                WHERE 1=1
+            """
+            
+            params = []
+            
+            # Filtro Ricerca
+            if search:
+                term = f"%{search.lower()}%"
+                query += """ AND (
+                    LOWER(s.cognome) LIKE %s OR 
+                    LOWER(s.nome) LIKE %s OR 
+                    LOWER(s.codice_fiscale) LIKE %s OR
+                    LOWER(c.nome_corso) LIKE %s
+                )"""
+                params.extend([term, term, term, term])
+            
+            # Filtri Date
+            if start_date:
+                query += " AND a.data_svolgimento >= %s"
+                params.append(start_date)
+            if end_date:
+                query += " AND a.data_svolgimento <= %s"
+                params.append(end_date)
+                
+            query += " ORDER BY a.data_svolgimento DESC"
+            
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
+            
+            # Mappatura risultati per la UI
+            for row in rows:
+                # I dati arrivano nell'ordine della SELECT
+                data_svol = row[1]
+                
+                # Calcolo scadenza (Esempio: 5 anni dopo lo svolgimento)
+                # Puoi personalizzarlo o renderlo dipendente dal corso
+                try:
+                    scadenza = data_svol.replace(year=data_svol.year + 5)
+                except:
+                    scadenza = None
+
+                results.append({
+                    'ID': row[0],
+                    'DATA_EMISSIONE': data_svol,
+                    'CORSISTA': f"{row[3]} {row[4]}", # Cognome + Nome
+                    'CF': row[2],
+                    'CORSO': row[5],
+                    'SCADENZA': scadenza
+                })
+                
+        except Exception as e:
+            print(f"Errore AttestatiRepo: {e}")
+        finally:
+            if conn: conn.close()
+            
+        return results
+    
+    @staticmethod
+    def insert_attestato(cf, id_corso, data_svolgimento):
+        """
+        Salva un nuovo attestato nella tabella t_attestati
+        """
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            query = """
+                INSERT INTO public.t_attestati 
+                (id_soggetto_fk, id_corso_fk, data_svolgimento)
+                VALUES (%s, %s, %s)
+            """
+            cursor.execute(query, (cf, id_corso, data_svolgimento))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"Errore Insert Attestato: {e}")
+            if conn: conn.rollback()
+            return False
+        finally:
+            if conn: conn.close()
+
 # --- REPOSITORY AUTENTICAZIONE ---
 class AuthRepo:
     @staticmethod
@@ -279,99 +391,101 @@ class AuthRepo:
 
 class CorsoRepo:
     @staticmethod
-    def get_all(search_term=''):
+    def get_all(search=''):
         conn = None
         try:
             conn = get_db_connection()
-            cur = conn.cursor()
+            cursor = conn.cursor()
             
-            # --- AGGIUNTO TEMPLATE_FILE ---
-            sql = "SELECT ID_CORSO, NOME_CORSO, ORE_DURATA, CODICE_BREVE, PROGRAMMA, TEMPLATE_FILE FROM T_CORSI"
+            # SELECT che include validita_anni
+            query = """
+                SELECT id_corso, nome_corso, ore_durata, codice_breve, programma, template_file, validita_anni
+                FROM public.t_corsi
+            """
             params = []
-            
-            if search_term:
-                term = search_term.strip() + '%'
-                sql += " WHERE (NOME_CORSO ILIKE %s) OR (CODICE_BREVE ILIKE %s)"
+            if search:
+                query += " WHERE nome_corso ILIKE %s OR codice_breve ILIKE %s"
+                term = f"%{search}%"
                 params = [term, term]
             
-            sql += " ORDER BY NOME_CORSO"
+            query += " ORDER BY id_corso ASC"
+            cursor.execute(query, tuple(params))
             
-            cur.execute(sql, tuple(params))
-            rows = cur.fetchall()
-            
-            return [{
-                'ID_CORSO': r[0], 
-                'NOME_CORSO': r[1], 
-                'ORE_DURATA': r[2], 
-                'CODICE_BREVE': r[3],
-                'PROGRAMMA': r[4] if r[4] else '',
-                'TEMPLATE_FILE': r[5] if r[5] else '' # <--- NUOVO
-            } for r in rows]
+            col_names = [desc[0].upper() for desc in cursor.description]
+            results = []
+            for row in cursor.fetchall():
+                results.append(dict(zip(col_names, row)))
+            return results
         except Exception as e:
-            print(f"Err CorsoRepo: {e}")
-            logger.error(f"Errore critico durante la lettura del CorsoRepo: {e}")
-            logger.error("Eccezione completa:", exc_info=True)
+            print(f"Errore CorsoRepo.get_all: {e}")
             return []
         finally:
             if conn: conn.close()
 
     @staticmethod
     def get_next_id():
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT MAX(ID_CORSO) FROM T_CORSI")
-            row = cur.fetchone()
-            return (row[0] + 1) if row and row[0] else 1
-        except Exception: return 1
-        finally:
-            if conn: conn.close()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COALESCE(MAX(id_corso), 0) + 1 FROM public.t_corsi")
+        res = cursor.fetchone()[0]
+        conn.close()
+        return res
 
     @staticmethod
-    def upsert(data, is_new=True):
+    def upsert(data, is_new):
         conn = None
         try:
             conn = get_db_connection()
-            cur = conn.cursor()
+            cursor = conn.cursor()
             
-            params = (
-                data['NOME_CORSO'], 
-                data['ORE_DURATA'], 
-                data['CODICE_BREVE'], 
-                data['PROGRAMMA'], 
-                data['TEMPLATE_FILE'], # <--- NUOVO
-                data['ID_CORSO']
-            )
+            # Recuperiamo il valore SENZA default. Se manca è None -> DB NULL
+            val_anni = data.get('VALIDITA_ANNI') 
 
             if is_new:
-                sql = "INSERT INTO T_CORSI (NOME_CORSO, ORE_DURATA, CODICE_BREVE, PROGRAMMA, TEMPLATE_FILE, ID_CORSO) VALUES (%s, %s, %s, %s, %s, %s)"
+                # INSERT
+                query = """
+                    INSERT INTO public.t_corsi 
+                    (id_corso, nome_corso, ore_durata, codice_breve, programma, template_file, validita_anni)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(query, (
+                    data['ID_CORSO'], data['NOME_CORSO'], data['ORE_DURATA'], 
+                    data['CODICE_BREVE'], data['PROGRAMMA'], data['TEMPLATE_FILE'],
+                    val_anni # Passa None se vuoto
+                ))
+                msg = "Corso creato"
             else:
-                sql = "UPDATE T_CORSI SET NOME_CORSO=%s, ORE_DURATA=%s, CODICE_BREVE=%s, PROGRAMMA=%s, TEMPLATE_FILE=%s WHERE ID_CORSO=%s"
+                # UPDATE
+                query = """
+                    UPDATE public.t_corsi 
+                    SET nome_corso=%s, ore_durata=%s, codice_breve=%s, 
+                        programma=%s, template_file=%s, validita_anni=%s
+                    WHERE id_corso=%s
+                """
+                cursor.execute(query, (
+                    data['NOME_CORSO'], data['ORE_DURATA'], 
+                    data['CODICE_BREVE'], data['PROGRAMMA'], data['TEMPLATE_FILE'],
+                    val_anni, # Passa None se vuoto
+                    data['ID_CORSO']
+                ))
+                msg = "Corso aggiornato"
             
-            cur.execute(sql, params)
             conn.commit()
-            return True, "Salvataggio completato."
+            return True, msg
         except Exception as e:
-            return False, f"Errore DB: {str(e)}"
+            if conn: conn.rollback()
+            return False, str(e)
         finally:
             if conn: conn.close()
 
     @staticmethod
     def delete(id_corso):
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("DELETE FROM T_CORSI WHERE ID_CORSO = %s", (id_corso,))
-            conn.commit()
-            return True, "Corso eliminato."
-        except psycopg2.IntegrityError:
-            return False, "Impossibile eliminare: Esistono attestati collegati!"
-        except Exception as e:
-            return False, f"Err: {e}"
-        finally:
-            if conn: conn.close()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM public.t_corsi WHERE id_corso = %s", (id_corso,))
+        conn.commit()
+        conn.close()
+        return True, "Eliminato"
 
 # --- REPOSITORY ENTI (COMPLETA) ---
 class EnteRepo:
@@ -490,6 +604,86 @@ class EnteRepo:
         except Exception: return False
         finally:
             if conn: conn.close()
+
+    @staticmethod
+    def get_history(search='', start_date=None, end_date=None):
+        """
+        Recupera lo storico unendo t_attestati, t_soggetti e t_corsi.
+        """
+        conn = None
+        results = []
+        try:
+            # Usa la tua funzione di connessione che è già in questo file
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            
+            # QUERY CORRETTA PER LA TUA TABELLA t_attestati
+            query = """
+                SELECT 
+                    a.id_attestato,
+                    a.data_svolgimento,
+                    s.codice_fiscale,
+                    s.cognome,
+                    s.nome,
+                    c.nome_corso
+                FROM public.t_attestati a
+                JOIN public.t_soggetti s ON a.id_soggetto_fk = s.codice_fiscale
+                JOIN public.t_corsi c ON a.id_corso_fk = c.id_corso
+                WHERE 1=1
+            """
+            
+            params = []
+            
+            # Filtro Ricerca
+            if search:
+                term = f"%{search.lower()}%"
+                query += """ AND (
+                    LOWER(s.cognome) LIKE %s OR 
+                    LOWER(s.nome) LIKE %s OR 
+                    LOWER(s.codice_fiscale) LIKE %s OR
+                    LOWER(c.nome_corso) LIKE %s
+                )"""
+                params.extend([term, term, term, term])
+            
+            # Filtri Date
+            if start_date:
+                query += " AND a.data_svolgimento >= %s"
+                params.append(start_date)
+            if end_date:
+                query += " AND a.data_svolgimento <= %s"
+                params.append(end_date)
+                
+            query += " ORDER BY a.data_svolgimento DESC"
+            
+            cursor.execute(query, tuple(params))
+            rows = cursor.fetchall()
+            
+            # Mappatura risultati per la UI
+            for row in rows:
+                # I dati arrivano nell'ordine della SELECT
+                data_svol = row[1]
+                
+                # Calcolo scadenza (Esempio: 5 anni dopo lo svolgimento)
+                try:
+                    scadenza = data_svol.replace(year=data_svol.year + 5)
+                except:
+                    scadenza = None
+
+                results.append({
+                    'ID': row[0],
+                    'DATA_EMISSIONE': data_svol,
+                    'CORSISTA': f"{row[3]} {row[4]}", # Cognome + Nome
+                    'CF': row[2],
+                    'CORSO': row[5],
+                    'SCADENZA': scadenza
+                })
+                
+        except Exception as e:
+            print(f"Errore AttestatiRepo: {e}")
+        finally:
+            if conn: conn.close()
+            
+        return results
 
 # --- HELPERS RICERCA E DATI ---
 def get_user_details_from_db_sync(search_term: str):
@@ -831,122 +1025,61 @@ def gestione_accessi_page():
 
 @ui.page('/gestionecorsi')
 def gestionecorsi_page():
-    # Check Autenticazione
     if not app.storage.user.get('authenticated', False): 
         ui.navigate.to('/')
         return
 
-    # Stato locale della pagina
-    state = {'is_new': True, 'search': ''}
-
-    # --- 1. CONFIGURAZIONE E VARIABILI ---
-    ABSOLUTE_PATH_TO_TEMPLATES = '/home/ubuntu/app/WorkSafeManager/templates'
+    state = {'is_new': True, 'search': '', 'row_to_delete': None}
     
-    # Riferimenti ai componenti UI
+    # --- CONFIGURAZIONE PATH ---
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    ABSOLUTE_PATH_TO_TEMPLATES = os.path.join(BASE_DIR, 'templates')
+    
+    # Riferimenti UI
     id_input = None
     nome_input = None
     ore_input = None
+    validita_input = None # <--- NUOVO CAMPO VALIDITÀ
     codice_input = None
     programma_input = None
     template_select = None 
     
     dialog_ref = None
     dialog_label = None
+    confirm_dialog = None
     table_ref = None
 
-    # --- 2. HELPER FUNCTIONS ---
-
+    # --- HELPER ---
     def get_template_files():
-        """Scansiona la cartella e restituisce la lista dei file .docx"""
         if not os.path.exists(ABSOLUTE_PATH_TO_TEMPLATES):
-            try:
-                os.makedirs(ABSOLUTE_PATH_TO_TEMPLATES)
-            except OSError:
-                return []
+            try: os.makedirs(ABSOLUTE_PATH_TO_TEMPLATES)
+            except: return []
         return [f for f in os.listdir(ABSOLUTE_PATH_TO_TEMPLATES) if f.endswith('.docx') and not f.startswith('~$')]
 
     async def handle_template_upload(e):
-        """Gestisce l'upload leggendo nome e contenuto da e.file"""
-        
-        original_filename = "sconosciuto.docx"
-        
-        # --- 1. RECUPERO NOME FILE ---
         try:
-            if hasattr(e, 'file'):
-                # Nel tuo caso, i dati sono dentro e.file
-                f = e.file
-                if hasattr(f, 'name'): original_filename = f.name
-                elif hasattr(f, 'filename'): original_filename = f.filename
-            else:
-                # Fallback standard
-                original_filename = getattr(e, 'name', "upload_senza_nome.docx")
-        except: 
-            pass
-
-        # Sanitizzazione nome
-        original_filename = os.path.basename(original_filename).replace('\\', '').replace('/', '')
-        if not original_filename: original_filename = "upload_senza_nome.docx"
-
-        target_path = os.path.join(ABSOLUTE_PATH_TO_TEMPLATES, original_filename)
-
-        # --- 2. CREAZIONE CARTELLA ---
-        try:
+            original_filename = e.name or "upload.docx"
+            original_filename = os.path.basename(original_filename).replace('\\', '').replace('/', '')
+            target_path = os.path.join(ABSOLUTE_PATH_TO_TEMPLATES, original_filename)
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        except Exception as create_err:
-            ui.notify("ERRORE: Permessi negati.", color='red')
-            return
-
-        # --- 3. RECUPERO E SCRITTURA CONTENUTO (FIX) ---
-        try:
-            content_to_write = None
+            with open(target_path, 'wb') as f: f.write(e.content.read())
             
-            # Strategia A: e.content (Standard)
-            if hasattr(e, 'content'):
-                content_to_write = e.content
-            
-            # Strategia B: e.file (Il tuo caso specifico)
-            elif hasattr(e, 'file'):
-                content_to_write = e.file
-            
-            if not content_to_write:
-                ui.notify("Errore: Oggetto file vuoto.", color='red')
-                return
-
-            # Reset cursore se possibile
-            if hasattr(content_to_write, 'seek'):
-                try: content_to_write.seek(0)
-                except: pass
-
-            # Lettura (Supporto Async/Sync)
-            read_result = content_to_write.read()
-            
-            if asyncio.iscoroutine(read_result):
-                data = await read_result
-            else:
-                data = read_result
-            
-            # Scrittura fisica
-            with open(target_path, 'wb') as f:
-                f.write(data)
-            
-            ui.notify(f"File '{original_filename}' caricato!", color='green')
-            logger.info(f"UPLOAD RIUSCITO: {target_path}")
-
+            ui.notify(f"Caricato: {original_filename}", color='green')
+            if template_select:
+                template_select.options = get_template_files()
+                template_select.value = original_filename
+                template_select.update()
         except Exception as err:
-            ui.notify(f"Errore salvataggio: {err}", color='red')
-            logger.error(f"Errore critico upload: {err}", exc_info=True)
+            ui.notify(f"Errore upload: {err}", color='red')
 
-    # --- 3. LOGICA OPERATIVA (CRUD) ---
-
+    # --- LOGICA ---
     async def refresh_table():
-        """Ricarica i dati della tabella dal DB"""
         rows = await asyncio.to_thread(CorsoRepo.get_all, state['search'])
         if table_ref: 
             table_ref.rows = rows
             table_ref.update()
 
     async def open_dialog(row=None):
-        """Apre il dialog per Creazione o Modifica"""
         files_disponibili = get_template_files()
         if template_select:
             template_select.options = files_disponibili
@@ -960,6 +1093,11 @@ def gestionecorsi_page():
             id_input.value = row['ID_CORSO']
             nome_input.value = row['NOME_CORSO']
             ore_input.value = row['ORE_DURATA']
+            
+            # Gestione Validità (Default 5 se manca)
+            val_anni = row.get('VALIDITA_ANNI')
+            validita_input.value = val_anni if val_anni else 5 
+            
             codice_input.value = row['CODICE_BREVE']
             programma_input.value = row['PROGRAMMA']
             
@@ -972,20 +1110,28 @@ def gestionecorsi_page():
             id_input.value = next_id
             nome_input.value = ''
             ore_input.value = 8
+            validita_input.value = 5 # Default per i nuovi corsi
             codice_input.value = ''
             programma_input.value = ''
             template_select.value = None
 
     async def save_corso():
-        """Salva i dati nel DB"""
         if not nome_input.value: 
             ui.notify('Nome corso obbligatorio!', type='warning')
+            return
+            
+        ore_val = float(ore_input.value) if ore_input.value else 0
+        validita_val = int(validita_input.value) if validita_input.value else 5
+        
+        if ore_val <= 0:
+            ui.notify('Durata ore non valida', type='warning')
             return
 
         data = {
             'ID_CORSO': int(id_input.value),
             'NOME_CORSO': nome_input.value.strip(),
-            'ORE_DURATA': float(ore_input.value) if ore_input.value else 0,
+            'ORE_DURATA': ore_val,
+            'VALIDITA_ANNI': validita_val, # <--- SALVIAMO IL DATO
             'CODICE_BREVE': codice_input.value.strip() if codice_input.value else '',
             'PROGRAMMA': programma_input.value.strip() if programma_input.value else '',
             'TEMPLATE_FILE': template_select.value
@@ -1000,92 +1146,100 @@ def gestionecorsi_page():
         else:
             ui.notify(msg, type='negative')
 
-    async def delete_corso(row):
-        """Elimina il corso"""
+    # Delete logic
+    def open_confirm_delete(row):
+        state['row_to_delete'] = row
+        confirm_dialog.open()
+
+    async def execute_delete():
+        if not state['row_to_delete']: return
+        row = state['row_to_delete']
         success, msg = await asyncio.to_thread(CorsoRepo.delete, row['ID_CORSO'])
         if success:
             ui.notify(msg, type='positive')
             await refresh_table()
         else:
-            ui.notify(msg, type='negative', close_button=True, multi_line=True)
+            ui.notify(msg, type='negative')
+        confirm_dialog.close()
+        state['row_to_delete'] = None
 
-    # --- 4. INTERFACCIA UTENTE (LAYOUT) ---
-    
-    with ui.column().classes('w-full items-center p-8 max-w-screen-xl mx-auto bg-slate-50 min-h-screen'):
-        
-        with ui.row().classes('w-full items-center mb-6 justify-between'):
-            
+    # --- LAYOUT ---
+    with ui.column().classes('w-full items-center p-8 bg-slate-50 min-h-screen'):
+        with ui.row().classes('w-full items-center mb-6 justify-between max-w-screen-xl'):
             with ui.row().classes('items-center gap-4'):
-                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense')
+                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense text-color=slate-700')
                 ui.label('Gestione Corsi').classes('text-3xl font-bold text-slate-800')
-            
-            with ui.row().classes('items-center gap-4'):
-                # Bottone Upload
-                ui.upload(
-                    on_upload=handle_template_upload,
-                    label='Carica Modelli (.docx)',
-                    auto_upload=True,
-                    multiple=True
-                ).props('accept=".docx" flat color=blue-7').classes('text-sm')
-                
-                ui.button('Nuovo Corso', icon='add', on_click=lambda: open_dialog(None)).props('unelevated color=primary')
+            ui.button('Nuovo Corso', icon='add', on_click=lambda: open_dialog(None)).props('unelevated color=primary')
 
-        with ui.card().classes('w-full p-2 mb-4 flex flex-row items-center gap-4'):
+        with ui.card().classes('w-full p-2 mb-4 flex flex-row items-center gap-4 max-w-screen-xl'):
             ui.icon('search').classes('text-grey ml-2')
             ui.input(placeholder='Cerca corso...').classes('flex-grow').props('borderless').bind_value(state, 'search').on('keydown.enter', refresh_table)
             ui.button('Cerca', on_click=refresh_table).props('flat color=primary')
 
+        # Tabella
         cols = [
-            {'name': 'ID_CORSO', 'label': 'ID', 'field': 'ID_CORSO', 'align': 'left', 'sortable': True},
-            {'name': 'NOME_CORSO', 'label': 'Nome', 'field': 'NOME_CORSO', 'align': 'left', 'sortable': True},
-            {'name': 'TEMPLATE_FILE', 'label': 'Modello Attestato', 'field': 'TEMPLATE_FILE', 'align': 'left', 'classes': 'text-gray-500 italic'},
+            {'name': 'ID_CORSO', 'label': 'ID', 'field': 'ID_CORSO', 'align': 'left', 'sortable': True, 'style': 'width: 50px'},
+            {'name': 'CODICE_BREVE', 'label': 'Codice', 'field': 'CODICE_BREVE', 'align': 'left', 'sortable': True},
+            {'name': 'NOME_CORSO', 'label': 'Nome', 'field': 'NOME_CORSO', 'align': 'left', 'sortable': True, 'classes': 'font-bold'},
+            {'name': 'ORE_DURATA', 'label': 'Ore', 'field': 'ORE_DURATA', 'align': 'center'},
+            {'name': 'VALIDITA_ANNI', 'label': 'Validità (Anni)', 'field': 'VALIDITA_ANNI', 'align': 'center'}, # Nuova Colonna
+            {'name': 'TEMPLATE_FILE', 'label': 'Modello', 'field': 'TEMPLATE_FILE', 'align': 'left', 'classes': 'text-gray-500 italic'},
             {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
         ]
         
-        table_ref = ui.table(columns=cols, rows=[], row_key='ID_CORSO').classes('w-full shadow-md bg-white')
+        table_ref = ui.table(columns=cols, rows=[], row_key='ID_CORSO').classes('w-full shadow-md bg-white max-w-screen-xl')
         
         table_ref.add_slot('body-cell-azioni', r'''
             <q-td key="azioni" :props="props">
-                <q-btn icon="edit" size="sm" round flat color="grey-8" @click="$parent.$emit('edit', props.row)" />
+                <q-btn icon="edit" size="sm" round flat color="primary" @click="$parent.$emit('edit', props.row)" />
                 <q-btn icon="delete" size="sm" round flat color="red" @click="$parent.$emit('delete', props.row)" />
             </q-td>
         ''')
-        
         table_ref.on('edit', lambda e: open_dialog(e.args))
-        table_ref.on('delete', lambda e: delete_corso(e.args))
+        table_ref.on('delete', lambda e: open_confirm_delete(e.args))
         
         ui.timer(0.1, refresh_table, once=True)
 
-    # --- 5. DIALOG (MODALE) ---
+    # --- DIALOG ---
     with ui.dialog() as dialog_ref, ui.card().classes('w-full max-w-2xl p-6 gap-4'):
-        
-        dialog_label = ui.label('Corso').classes('text-xl font-bold mb-2')
+        dialog_label = ui.label('Corso').classes('text-xl font-bold mb-2 text-slate-800')
         
         with ui.row().classes('w-full gap-4'):
-            id_input = ui.input('ID').props('outlined dense readonly').classes('w-24')
-            nome_input = ui.input('Nome Corso').props('outlined dense').classes('flex-grow')
+            id_input = ui.input('ID').props('outlined dense readonly').classes('w-20 bg-gray-100')
+            nome_input = ui.input('Nome Corso *').props('outlined dense').classes('flex-grow')
             
         with ui.row().classes('w-full gap-4'):
-            codice_input = ui.input('Codice Breve').props('outlined dense uppercase').classes('w-1/2')
-            ore_input = ui.number('Ore').props('outlined dense').classes('w-1/3')
+            codice_input = ui.input('Codice Breve').props('outlined dense uppercase').classes('w-1/3')
+            
+            # ORE e VALIDITA affiancati
+            ore_input = ui.number('Ore Durata').props('outlined dense').classes('w-1/4')
+            validita_input = ui.number('Validità (Anni)', min=1, max=10).props('outlined dense').classes('w-1/4')
 
         ui.separator()
         
-        # Solo selettore, upload è fuori
-        template_select = ui.select(
-            options=[], 
-            label='Seleziona Modello Word (.docx)'
-        ).props('outlined dense options-dense').classes('w-full')
-        
-        ui.label('Programma Corso').classes('text-sm text-gray-500 mt-2')
-        programma_input = ui.textarea('Programma').props('outlined dense rows=10').classes('w-full')
+        with ui.row().classes('w-full items-center gap-2'):
+            template_select = ui.select(options=[], label='Seleziona Modello Word (.docx)').props('outlined dense options-dense').classes('flex-grow')
+            ui.upload(on_upload=handle_template_upload, auto_upload=True, multiple=False, label='')\
+                .props('accept=".docx" flat dense color=primary no-thumbnails icon=cloud_upload').tooltip('Carica Nuovo Modello').classes('w-auto')
 
-        with ui.row().classes('w-full justify-end mt-4'):
+        ui.label('Programma Corso').classes('text-sm text-gray-600 font-bold mt-2')
+        programma_input = ui.textarea(placeholder='Inserisci dettagli programma...').props('outlined dense rows=6').classes('w-full')
+
+        with ui.row().classes('w-full justify-end mt-4 gap-2'):
             ui.button('Annulla', on_click=dialog_ref.close).props('flat color=grey')
-            ui.button('Salva', on_click=save_corso).props('unelevated color=primary')
+            ui.button('Salva', on_click=save_corso).props('unelevated color=primary icon=save')
+
+    with ui.dialog() as confirm_dialog, ui.card().classes('p-6 items-center text-center'):
+        ui.icon('warning', size='xl').classes('text-red-500 mb-2')
+        ui.label('Sei sicuro?').classes('text-xl font-bold')
+        ui.label('Il corso verrà eliminato.').classes('text-gray-600 mb-4')
+        with ui.row().classes('gap-4'):
+            ui.button('Annulla', on_click=confirm_dialog.close).props('flat color=grey')
+            ui.button('Elimina', on_click=execute_delete).props('unelevated color=red')
 
 @ui.page('/dashboard')
 def dashboard_page():
+    # Controllo Autenticazione
     if not app.storage.user.get('authenticated', False):
         ui.navigate.to('/') 
         return 
@@ -1093,75 +1247,99 @@ def dashboard_page():
     username = app.storage.user.get('username', 'Utente')
 
     # --- 1. LAYOUT PAGINA ---
-    with ui.column().classes('w-full items-center p-8'):
+    with ui.column().classes('w-full items-center p-8 bg-slate-50 min-h-screen'):
         
-        # TITOLO
-        ui.label(f"Dashboard").classes("text-3xl font-bold mb-8 text-slate-800")
+        # HEADER
+        with ui.row().classes('w-full max-w-5xl justify-between items-center mb-8'):
+            with ui.column().classes('gap-0'):
+                ui.label(f"Ciao, {username}!").classes("text-3xl font-bold text-slate-800")
+                ui.label("Benvenuto nel WorkSafe Manager").classes("text-slate-500")
+            
+            # Tasto Logout in alto a destra
+            def logout_click():
+                app.storage.user['authenticated'] = False
+                ui.navigate.to('/')
+            
+            ui.button("Esci", on_click=logout_click, icon='logout').props('flat color=red')
+
         
-        # --- BANNER ---
-        with ui.card().classes('w-full max-w-4xl bg-blue-100 border-l-8 border-blue-600 p-6 mb-8 flex flex-row items-center justify-center gap-12 shadow-sm'):
+        # --- BANNER STATISTICHE ---
+        with ui.card().classes('w-full max-w-5xl bg-gradient-to-r from-blue-600 to-indigo-700 text-white p-6 mb-10 shadow-lg rounded-xl flex flex-row items-center justify-between'):
             
-            # Parte Sinistra: Icona e Testo
-            with ui.row().classes('items-center gap-4'):
-                ui.icon('verified', size='lg').classes('text-blue-600')
-                with ui.column().classes('gap-0'):
-                    ui.label('Attestati emessi oggi').classes('text-lg text-blue-900 font-medium')
-                    ui.label('Monitoraggio giornaliero').classes('text-sm text-blue-700 opacity-80')
+            # Parte Sinistra: Testo
+            with ui.row().classes('items-center gap-6'):
+                with ui.element('div').classes('p-4 bg-white/20 rounded-full'):
+                    ui.icon('verified', size='2.5em').classes('text-white')
+                
+                with ui.column().classes('gap-1'):
+                    ui.label('Attestati emessi oggi').classes('text-xl font-semibold')
+                    ui.label(datetime.now().strftime('%d %B %Y')).classes('text-sm opacity-80')
             
-            # Parte Destra: Il Numero (Box Bianco)
-            with ui.column().classes('items-center bg-white rounded-lg px-6 py-2 shadow-sm'):
-                # --- CORREZIONE: Creiamo l'etichetta QUI, direttamente al suo posto ---
-                count_label = ui.label('...').classes('text-2xl font-bold text-blue-800')
-                ui.label('Totale').classes('text-xs text-gray-500 uppercase tracking-wider')
+            # Parte Destra: Il Numero
+            with ui.column().classes('items-center bg-white text-blue-800 rounded-lg px-8 py-3 shadow-md min-w-[120px]'):
+                count_label = ui.label('...').classes('text-4xl font-bold')
+                ui.label('TOTALE').classes('text-[10px] font-bold tracking-widest opacity-60')
 
-        # --- PULSANTI DI NAVIGAZIONE ---
-        with ui.row().classes('w-full justify-center gap-6 flex-wrap'):
-            
-            # Crea Attestati
-            with ui.card().classes('w-64 h-40 flex flex-col items-center justify-center cursor-pointer hover:shadow-xl transition-all hover:scale-105').on('click', lambda: ui.navigate.to('/creaattestati')):
-                 ui.icon('explore', size='3em').classes('mb-2 text-indigo-600')
-                 ui.label('Crea Attestati').classes('text-center text-lg font-bold w-full text-slate-700')
-            
-            # Gestione Utenti
-            with ui.card().classes('w-64 h-40 flex flex-col items-center justify-center cursor-pointer hover:shadow-xl transition-all hover:scale-105').on('click', lambda: ui.navigate.to('/gestioneutenti')):
-                 ui.icon('people', size='3em').classes('mb-2 text-emerald-600')
-                 ui.label('Gestione Utenti').classes('text-center text-lg font-bold w-full text-slate-700')
-            
-            # Gestione Enti
-            with ui.card().classes('w-64 h-40 flex flex-col items-center justify-center cursor-pointer hover:shadow-xl transition-all hover:scale-105').on('click', lambda: ui.navigate.to('/gestioneenti')):
-                 ui.icon('business', size='3em').classes('mb-2 text-amber-600')
-                 ui.label('Gestione Enti').classes('text-center text-lg font-bold w-full text-slate-700')
-            
-            # Gestione Docenti
-            with ui.card().classes('w-64 h-40 flex flex-col items-center justify-center cursor-pointer hover:shadow-xl transition-all hover:scale-105').on('click', lambda: ui.navigate.to('/gestionedocenti')):
-                 ui.icon('school', size='3em').classes('mb-2 text-rose-600')
-                 ui.label('Gestione Docenti').classes('text-center text-lg font-bold w-full text-slate-700')
 
-            # Gestione Corsi
-            with ui.card().classes('w-64 h-40 flex flex-col items-center justify-center cursor-pointer hover:shadow-xl transition-all hover:scale-105').on('click', lambda: ui.navigate.to('/gestionecorsi')):
-                 ui.icon('menu_book', size='3em').classes('mb-2 text-purple-600')
-                 ui.label('Gestione Corsi').classes('text-center text-lg font-bold w-full text-slate-700')
+        # --- GRIGLIA NAVIGAZIONE ---
+        # Usiamo CSS Grid per un allineamento perfetto delle card
+        with ui.grid().classes('w-full max-w-5xl grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6'):
             
-            # Gestione Accessi (Login)
-            with ui.card().classes('w-64 h-40 flex flex-col items-center justify-center cursor-pointer hover:shadow-xl transition-all hover:scale-105').on('click', lambda: ui.navigate.to('/gestione_accessi')):
-                 ui.icon('lock_person', size='3em').classes('mb-2 text-gray-700')
-                 ui.label('Gestione Accessi').classes('text-center text-lg font-bold w-full text-slate-700')
+            def crea_card_menu(titolo, icona, colore, link):
+                """Helper per creare le card tutte uguali"""
+                color_map = {
+                    'indigo': 'text-indigo-600 group-hover:text-indigo-700',
+                    'emerald': 'text-emerald-600 group-hover:text-emerald-700',
+                    'amber': 'text-amber-600 group-hover:text-amber-700',
+                    'rose': 'text-rose-600 group-hover:text-rose-700',
+                    'purple': 'text-purple-600 group-hover:text-purple-700',
+                    'gray': 'text-gray-600 group-hover:text-gray-800',
+                    'cyan': 'text-cyan-600 group-hover:text-cyan-700 bg-cyan-50 group-hover:bg-cyan-100',
+                    'orange': 'text-orange-600 group-hover:text-orange-700 bg-orange-50 group-hover:bg-orange-100',
+                }
+                c_text = color_map.get(colore, 'text-blue-600')
 
-        # LOGOUT
-        def logout_click():
-            app.storage.user['authenticated'] = False
-            ui.navigate.to('/')
-        
-        ui.button("Logout", on_click=logout_click, icon='logout').classes("bg-red-500 text-white mt-12 px-8 py-2 rounded-full shadow-lg hover:bg-red-600")
+                with ui.card().classes('group cursor-pointer hover:shadow-xl transition-all duration-300 hover:-translate-y-1 h-48 flex flex-col items-center justify-center gap-4 border border-gray-100') \
+                     .on('click', lambda: ui.navigate.to(link)):
+                     
+                     # Icona con cerchio sfondo sfumato
+                     with ui.element('div').classes(f'p-4 rounded-full bg-{colore}-50 group-hover:bg-{colore}-100 transition-colors'):
+                        ui.icon(icona, size='2.5em').classes(c_text)
+                     
+                     ui.label(titolo).classes('text-lg font-bold text-slate-700 group-hover:text-slate-900')
 
-    # --- 2. LOGICA DI AGGIORNAMENTO (DEFINITA ALLA FINE) ---
-    # Ora che count_label esiste nel layout, possiamo aggiornarlo.
-    
+            # 1. Crea Attestati (Principale)
+            crea_card_menu('Crea Attestati', 'explore', 'indigo', '/creaattestati')
+            
+            # 2. Gestione Corsi
+            crea_card_menu('Gestione Corsi', 'menu_book', 'purple', '/gestionecorsi')
+            
+            # 3. Gestione Utenti
+            crea_card_menu('Anagrafica Utenti', 'people', 'emerald', '/gestioneutenti')
+            
+            # 4. Gestione Docenti
+            crea_card_menu('Gestione Docenti', 'school', 'rose', '/gestionedocenti')
+            
+            # 5. Gestione Enti
+            crea_card_menu('Gestione Enti', 'business', 'amber', '/gestioneenti')
+            
+            # 6. Gestione Accessi
+            crea_card_menu('Gestione Accessi', 'lock_person', 'gray', '/gestione_accessi')
+            
+            # 7. Archivio
+            crea_card_menu('Archivio Storico', 'history', 'cyan', '/archivio')
+            
+            # 8. Scadenziario
+            crea_card_menu('Scadenzario', 'alarm', 'orange', '/scadenzario')
+
+
+    # --- LOGICA DI AGGIORNAMENTO ---
     async def update_counter():
+        # Esegue la funzione DB in un thread separato per non bloccare la UI
         n = await asyncio.to_thread(get_count_attestati_oggi_sync)
         count_label.set_text(f"{n}")
     
-    # Avvia i timer
+    # Aggiorna subito e poi ogni 10 secondi
     ui.timer(0.1, update_counter, once=True) 
     ui.timer(10.0, update_counter)
 
@@ -1202,52 +1380,144 @@ def creaattestati_page():
             ui.button('Torna', on_click=lambda: ui.navigate.to('/dashboard'), icon='arrow_back').props('flat round')
             ui.label('Generazione Attestati Massiva').classes('text-3xl ml-4')
         
+        def estrai_inizio_fine(testo):
+
+            if not testo: return None, None
+    
+            # Cerca tutte le date nel formato dd/mm/yyyy
+            matches = re.findall(r'(\d{2}/\d{2}/\d{4})', str(testo))
+            
+            valid_dates = []
+            for m in matches:
+                try:
+                    dt = datetime.strptime(m, '%d/%m/%Y').date()
+                    valid_dates.append(dt)
+                except:
+                    pass
+            
+            if not valid_dates:
+                return None, None
+            
+            # Restituisce (Inizio, Fine)
+            return min(valid_dates), max(valid_dates)
+        
         @ui.refreshable
         def render_lista_soggetti():
             if not soggetti:
                 ui.label("Nessun soggetto selezionato.").classes('text-sm italic p-4 text-gray-500')
                 return
 
-            grid_style = 'grid-template-columns: 0.9fr 0.9fr 0.8fr 2fr 1.2fr 0.9fr 2fr 0.4fr 0.3fr; width: 100%; gap: 8px; align-items: center;'
+            # Definizione colonne griglia
+            grid_style = 'grid-template-columns: 0.8fr 0.8fr 0.8fr 2fr 1.2fr 2.5fr 0.4fr 0.3fr; width: 100%; gap: 8px; align-items: start;'
             
-            # Header
-            with ui.grid().style(grid_style + 'font-weight: bold; border-bottom: 2px solid #ccc; padding-bottom: 5px;'):
-                ui.label('Cognome'); ui.label('Nome'); ui.label('Codice Fiscale'); ui.label('Corso'); ui.label('Docente'); ui.label('Data Rilascio'); ui.label('Note Date'); ui.label('Ore'); ui.label('')
+            # ---------------------------------------------------------
+            # 1. INTESTAZIONE (HEADER) - VA FUORI DAL CICLO FOR!
+            # ---------------------------------------------------------
+            with ui.grid().style(grid_style + 'font-weight: bold; border-bottom: 2px solid #ccc; padding-bottom: 5px; align-items: center;'):
+                ui.label('Cognome')
+                ui.label('Nome')
+                ui.label('CF')
+                
+                # Colonna Corso con bottone "Copia Giù" ⬇️
+                with ui.row().classes('items-center gap-1'):
+                    ui.label('Corso')
+                    ui.icon('arrow_downward').classes('cursor-pointer text-blue-400 hover:text-blue-700 text-xs') \
+                        .on('click', lambda: applica_a_tutti('cid')).tooltip("Copia il primo su tutti")
 
+                # Colonna Docente con bottone "Copia Giù" ⬇️
+                with ui.row().classes('items-center gap-1'):
+                    ui.label('Docente')
+                    ui.icon('arrow_downward').classes('cursor-pointer text-blue-400 hover:text-blue-700 text-xs') \
+                        .on('click', lambda: applica_a_tutti('docente_cf')).tooltip("Copia il primo su tutti")
+
+                # Colonna Calendario con bottone "Copia Giù" ⬇️
+                with ui.row().classes('items-center gap-1'):
+                    ui.label('Calendario / Orari')
+                    ui.icon('arrow_downward').classes('cursor-pointer text-blue-400 hover:text-blue-700 text-xs') \
+                        .on('click', lambda: applica_a_tutti('calendario_txt')).tooltip("Copia il primo su tutti")
+
+                ui.label('Ore')
+                ui.label('') # Spazio vuoto sopra il cestino
+
+            # ---------------------------------------------------------
+            # 2. CORPO DATI (BODY) - VA DENTRO IL CICLO FOR!
+            # ---------------------------------------------------------
             for cf, item in soggetti.items():
                 u_data = item['user']
-                if 'date_extra' not in item: item['date_extra'] = ''
-                if 'docente_cf' not in item: item['docente_cf'] = None # Init docente
+                
+                # Inizializzazioni di sicurezza
+                if 'calendario_txt' not in item: item['calendario_txt'] = ''
+                if 'docente_cf' not in item: item['docente_cf'] = None 
 
+                # Inizio riga utente
                 with ui.grid().style(grid_style + 'border-bottom: 1px solid #eee; padding: 5px;'):
-                    ui.label(u_data['COGNOME']).classes('text-sm truncate')
-                    ui.label(u_data['NOME']).classes('text-sm truncate')
-                    ui.label(u_data['CODICE_FISCALE']).classes('text-xs truncate')
                     
+                    # A. Dati Anagrafici (Solo lettura)
+                    ui.label(u_data['COGNOME']).classes('text-sm truncate pt-2 font-medium')
+                    ui.label(u_data['NOME']).classes('text-sm truncate pt-2')
+                    ui.label(u_data['CODICE_FISCALE']).classes('text-xs truncate pt-2 text-gray-500')
+                    
+                    # Funzione aggiornamento ore corso
                     def on_course_change(e, it=item):
                         it['ore'] = corsi_ore.get(e.value)
                     
-                    # Select Corso
-                    ui.select(options=corsi_opts, on_change=on_course_change).props('outlined dense options-dense').bind_value(item, 'cid').classes('w-full')
+                    # B. Select Corso
+                    ui.select(options=corsi_opts, on_change=on_course_change) \
+                        .props('outlined dense options-dense') \
+                        .bind_value(item, 'cid') \
+                        .classes('w-full')
                     
-                    # --- NUOVO: SELECT DOCENTE ---
-                    ui.select(options=docenti_opts).props('outlined dense options-dense').bind_value(item, 'docente_cf').classes('w-full')
+                    # C. Select Docente
+                    ui.select(options=docenti_opts) \
+                        .props('outlined dense options-dense') \
+                        .bind_value(item, 'docente_cf') \
+                        .classes('w-full')
                     
-                    # Data
-                    with ui.input().props('outlined dense').bind_value(item, 'per').classes('w-full') as date_inp:
-                        with date_inp.add_slot('append'):
-                            ui.icon('event').classes('cursor-pointer text-xs').on('click', lambda: menu.open())
-                            with ui.menu() as menu:
-                                ui.date().bind_value(item, 'per').on('update:model-value', lambda: menu.close())
+                    # D. Textarea Calendario con Feedback (Codice Infallibile)
+                    with ui.column().classes('w-full gap-0'):
+                        
+                        # D1. Textarea (Sopra)
+                        t_area = ui.textarea(placeholder='Es: 27/11/2025 14-18...') \
+                            .props('outlined dense rows=2 debounce=300') \
+                            .bind_value(item, 'calendario_txt') \
+                            .classes('w-full text-sm')
+                        
+                        # D2. Label Feedback (Sotto)
+                        lbl_feedback = ui.label('In attesa di inserimento...').classes('text-xs text-gray-400 italic ml-1 mt-1')
+
+                        # D3. Funzione di controllo
+                        def aggiorna_live(e):
+                            testo = ""
+                            if isinstance(e, str): testo = e
+                            elif hasattr(e, 'args') and e.args: testo = str(e.args)
+                            elif hasattr(e, 'value'): testo = str(e.value)
+                            
+                            ini, fin = estrai_inizio_fine(testo)
+                            
+                            if ini and fin:
+                                lbl_feedback.text = f"✅ Inizio: {ini.strftime('%d/%m')} - Fine: {fin.strftime('%d/%m')}"
+                                lbl_feedback.classes(add='text-green-600 font-bold', remove='text-red-500 text-gray-400')
+                            elif len(testo) > 5:
+                                lbl_feedback.text = "⚠️ Formato non riconosciuto (usa gg/mm/aaaa)"
+                                lbl_feedback.classes(add='text-red-500', remove='text-green-600 text-gray-400 font-bold')
+                            else:
+                                lbl_feedback.text = "In attesa di date..."
+                                lbl_feedback.classes(add='text-gray-400', remove='text-green-600 text-red-500 font-bold')
+
+                        # D4. Collegamento eventi
+                        t_area.on('update:model-value', lambda e: aggiorna_live(e))
+                        t_area.on('input', lambda e: aggiorna_live(e))
+                        
+                        # D5. Check iniziale
+                        if item['calendario_txt']:
+                             aggiorna_live(item['calendario_txt'])
                     
-                    # Note Extra
-                    ui.input(placeholder='Es: 28/06').props('outlined dense').bind_value(item, 'date_extra').classes('w-full')
+                    # E. Ore
+                    ui.number().props('outlined dense').bind_value(item, 'ore').classes('pt-0')
                     
-                    # Ore
-                    ui.number().props('outlined dense').bind_value(item, 'ore')
-                    
-                    # Delete
-                    ui.button(icon='delete', on_click=lambda _, c=cf: rimuovi_soggetto(c)).props('flat round dense color=red size=sm')
+                    # F. Bottone Elimina
+                    ui.button(icon='delete', on_click=lambda _, c=cf: rimuovi_soggetto(c)) \
+                        .props('flat round dense color=red size=sm').classes('mt-1')
 
         def process_user_addition(u_data):
             cf = u_data['CODICE_FISCALE']
@@ -1260,6 +1530,30 @@ def creaattestati_page():
             ui.notify(f"Aggiunto: {u_data['COGNOME']}", color='green')
             logger.info(f"Utente: {u_data['COGNOME']} {u_data['NOME']} aggiunto alla griglia!")
 
+        def applica_a_tutti(chiave):
+
+            if not soggetti: 
+                ui.notify("Lista vuota, niente da copiare.", color='orange')
+                return
+
+            prima_chiave = list(soggetti.keys())[0]
+            valore_sorgente = soggetti[prima_chiave].get(chiave)
+            
+            if not valore_sorgente:
+                ui.notify("Il primo rigo è vuoto, impossibile copiare.", color='red')
+                return
+
+            # Applica a tutti
+            for cf in soggetti:
+                soggetti[cf][chiave] = valore_sorgente
+                
+                # Se stiamo copiando il Corso ('cid'), aggiorniamo anche le ore
+                if chiave == 'cid':
+                    soggetti[cf]['ore'] = corsi_ore.get(valore_sorgente)
+
+            render_lista_soggetti.refresh()
+            ui.notify(f"Dati copiati su {len(soggetti)} righe!", color='positive')
+        
         def rimuovi_soggetto(cf):
             if cf in soggetti: del soggetti[cf]; render_lista_soggetti.refresh(); count_label.set_text(f"Totale: {len(soggetti)}")
         
@@ -1306,12 +1600,11 @@ def creaattestati_page():
         async def on_generate():
             items = list(soggetti.values())
             if not items: 
-                ui.notify("Lista vuota", color='red')
-                return
+                ui.notify("Lista vuota", color='red'); return
             
-            # Controllo preliminare dati mancanti
-            if any(not x['cid'] or not x['per'] for x in items): 
-                ui.notify("Dati mancanti (Corso o Data) per alcuni utenti!", color='red')
+            # Controllo preliminare: Il corso e il testo calendario devono esserci
+            if any(not x['cid'] or not x['calendario_txt'] for x in items): 
+                ui.notify("Dati mancanti (Corso o Calendario) per alcuni utenti!", color='red')
                 return
 
             ui.notify("Generazione in corso...", spinner=True)
@@ -1320,75 +1613,73 @@ def creaattestati_page():
             tmp = None
 
             try:
-                # Creazione cartella temporanea
                 tmp = tempfile.mkdtemp()
                 files_to_zip = []
                 
-                # Raggruppamento per Corso (cid) e Data (dt_obj)
+                # Dizionario per raggruppare i file
                 grouped_items = {}
+                
+                # --- FASE 1: ANALISI E RAGGRUPPAMENTO ---
                 for it in items:
-                    raw_date = it['per']
-                    dt_obj = date.today()
-                    # Parsing della data flessibile
-                    try:
-                        if re.search(r'\d{4}-\d{2}-\d{2}', str(raw_date)):
-                             dt_obj = datetime.strptime(re.search(r'\d{4}-\d{2}-\d{2}', str(raw_date)).group(0), '%Y-%m-%d').date()
-                        elif re.search(r'\d{2}/\d{2}/\d{4}', str(raw_date)):
-                             dt_obj = datetime.strptime(re.search(r'\d{2}/\d{2}/\d{4}', str(raw_date)).group(0), '%d/%m/%Y').date()
-                    except: pass
+                    raw_text = it['calendario_txt']
                     
-                    key = (it['cid'], dt_obj)
+                    # Estraiamo Inizio e Fine dal testo
+                    dt_inizio, dt_fine = estrai_inizio_fine(raw_text)
+                    
+                    if not dt_inizio:
+                        # Fallback se l'utente non scrive date valide
+                        dt_inizio = date.today()
+                        dt_fine = date.today()
+                        logger.warning(f"Nessuna data trovata in '{raw_text}', uso data odierna.")
+                    
+                    # Salviamo le date nell'oggetto per usarle nel prossimo ciclo
+                    it['_dt_inizio'] = dt_inizio
+                    it['_dt_fine'] = dt_fine
+
+                    # Raggruppiamo basandoci sulla DATA DI INIZIO
+                    # (Tutti quelli che iniziano lo stesso giorno nello stesso corso finiscono nella stessa cartella)
+                    key = (it['cid'], dt_inizio)
                     if key not in grouped_items: grouped_items[key] = []
                     grouped_items[key].append(it)
 
-                # Ciclo principale di generazione
-                for (cid, dt_val), group_list in grouped_items.items():
+                # --- FASE 2: CREAZIONE FILE ---
+                for (cid, dt_inizio_val), group_list in grouped_items.items():
                     
                     codice_corso = corsi_codici.get(cid, "GEN")
-                    n_sessione = await asyncio.to_thread(get_next_session_number_sync, cid, dt_val)
-                    data_codice = dt_val.strftime('%d%m%Y')
                     
-                    # Nome cartella output: es. 1_SIC_25112024
+                    # Calcoliamo il numero sessione basandoci sulla data di INIZIO
+                    n_sessione = await asyncio.to_thread(get_next_session_number_sync, cid, dt_inizio_val)
+                    data_codice = dt_inizio_val.strftime('%d%m%Y')
+                    
+                    # Nome cartella: es. 1_SIC_27112025 (Data Inizio)
                     sigla_cartella = f"{n_sessione}{codice_corso}{data_codice}"
                     path_sigla = os.path.join(tmp, sigla_cartella)
                     os.makedirs(path_sigla, exist_ok=True)
                     
                     nome_corso_full = corsi_opts[cid]
-                    
-                    # --- 1. RECUPERO DATI DINAMICI (Template e Programma) ---
-                    nome_template = corsi_templates.get(cid, 'modello.docx')
-                    if not nome_template: nome_template = 'modello.docx' # Sicurezza extra
-                    
+                    nome_template = corsi_templates.get(cid, 'modello.docx') or 'modello.docx'
                     programma_txt = corsi_programmi.get(cid, '')
-
-                    # --- 2. SPIA DI DEBUG (Viola) ---
-                    msg_debug = f"Corso ID {cid}: Uso file '{nome_template}'"
-                    print(msg_debug)
-                    ui.notify(msg_debug, color='purple', close_button=True)
-                    # -------------------------------
-
-                    # Percorso completo del file Word
                     path_template = os.path.join("templates", nome_template)
                     
-                    # Controllo esistenza file
                     if not os.path.exists(path_template):
-                        ui.notify(f"ERRORE GRAVE: Il file '{nome_template}' non esiste nella cartella 'templates'!", color='red', close_button=True, multi_line=True)
-                        return # Interrompe tutto per evitare crash o file sbagliati
+                        ui.notify(f"ERRORE: Template '{nome_template}' mancante!", color='red')
+                        return
 
-                    # --- 3. Generazione per ogni utente del gruppo ---
                     for it in group_list:
                         u = it['user']
-                        # Cartella Azienda
                         safe_az = re.sub(r'\W', '_', u.get('SOCIETA', 'Privati'))
                         final_dir = os.path.join(path_sigla, safe_az)
                         os.makedirs(final_dir, exist_ok=True)
                         
-                        data_inizio_str = dt_val.strftime('%d/%m/%Y')
-                        periodo_completo = f"{data_inizio_str} {it['date_extra']}" if it.get('date_extra') else data_inizio_str
-                        
                         nome_docente = docenti_opts.get(it.get('docente_cf'), '')
+                        
+                        # Testo completo inserito dall'utente (es. "27/11 14-18, 28/11 09-13")
+                        periodo_visualizzato = it['calendario_txt']
+                        
+                        # --- LOGICA RICHIESTA: DATA RILASCIO = ULTIMA DATA ---
+                        dt_fine_corrente = it['_dt_fine'] 
+                        data_rilascio_str = dt_fine_corrente.strftime('%d/%m/%Y')
 
-                        # Mappa Sostituzioni
                         d_map = {
                             "{{COGNOME}}": u['COGNOME'], 
                             "{{NOME}}": u['NOME'],
@@ -1398,93 +1689,129 @@ def creaattestati_page():
                             "{{LUOGO_NASCITA}}": u['LUOGO_NASCITA'],
                             "{{SOCIETA}}": u['SOCIETA'],
                             "{{NOME_CORSO}}": nome_corso_full,
-                            "{{DATA_SVOLGIMENTO}}": periodo_completo,
+                            "{{DATA_SVOLGIMENTO}}": periodo_visualizzato, # Testo libero completo
                             "{{ORE_DURATA}}": it['ore'],
-                            "{{DATA_RILASCIOAT}}" : data_inizio_str,
+                            "{{DATA_RILASCIOAT}}" : data_rilascio_str,    # Data fine corso
                             "{{SIGLA}}": sigla_cartella,
                             "{{DOCENTE}}": nome_docente,
-                            "{{PROGRAMMA}}": programma_txt  # <--- INSERISCE IL PROGRAMMA
+                            "{{PROGRAMMA}}": programma_txt
                         }
 
-                        # Chiamata generazione (passando il template specifico)
                         f = await asyncio.to_thread(generate_certificate_sync, d_map, path_template, final_dir)
                         files_to_zip.append(f)
                         
-                        # Salvataggio storico nel DB
-                        await asyncio.to_thread(save_attestato_to_db_sync, u['CODICE_FISCALE'], cid, dt_val)
+                        # Salvataggio DB: Usiamo dt_inizio_val per coerenza con la sessione creata
+                        await asyncio.to_thread(save_attestato_to_db_sync, u['CODICE_FISCALE'], cid, dt_inizio_val)
 
-                # Creazione ZIP finale
+                # --- FASE 3: ZIP E DOWNLOAD ---
                 z_name = f"Export_{datetime.now().strftime('%d%m%Y_%H%M%S')}.zip"
                 z_path = await asyncio.to_thread(generate_zip_sync, files_to_zip, tmp, z_name)
                 
                 ui.download(z_path)
-                ui.notify(f"Operazione completata! {len(files_to_zip)} attestati generati.", color='green')
+                ui.notify(f"Fatto! {len(files_to_zip)} attestati.", color='green')
                 
-                # Pulizia lista UI
+                # Pulizia UI
                 soggetti.clear()
                 render_lista_soggetti.refresh()
                 count_label.set_text("Totale: 0")
 
             except Exception as e:
                 logger.error(f"Errore generazione: {e}")
-                ui.notify(f"Errore durante la generazione: {e}", color='red', close_button=True, multi_line=True)
-                print(f"ERR GEN: {e}")
+                ui.notify(f"Errore: {e}", color='red', close_button=True, multi_line=True)
             finally:
-                # Pulizia file temporanei (dopo un po' per permettere il download)
                 await asyncio.sleep(10)
                 if z_path and os.path.exists(z_path): 
-                    try: os.remove(z_path)
-                    except: pass
+                    try: 
+                        os.remove(z_path)
+                    except: 
+                        pass
                 if tmp and os.path.exists(tmp): 
-                    try: shutil.rmtree(tmp, ignore_errors=True)
-                    except: pass
+                    try: 
+                        shutil.rmtree(tmp, ignore_errors=True)
+                    except: 
+                        pass
 
         ui.button("Genera attestati", on_click=on_generate).classes('w-full mt-6').props('color=blue size=lg')
 
 @ui.page('/gestioneutenti')
 def gestioneutenti_page():
-    if not app.storage.user.get('authenticated', False): ui.navigate.to('/'); return
+    if not app.storage.user.get('authenticated', False): 
+        ui.navigate.to('/')
+        return
     
-    state = {'is_new': True, 'search': ''}
+    # Stato locale
+    state = {'is_new': True, 'search': '', 'row_to_delete': None}
     
-    # --- 1. INIZIALIZZAZIONE VARIABILI (A NONE) ---
-    # Fondamentale per evitare problemi di scope
+    # Riferimenti UI (Inizializzati a None per sicurezza)
     cf_input = None
     cognome_input = None
     nome_input = None
     data_input_field = None
     luogo_input = None
     ente_select = None
+    # societa_input rimosso come richiesto
+    is_docente_check = None
     
     dialog_label = None
     table_ref = None
     dialog_ref = None
+    confirm_dialog = None 
 
-    # Helper per le opzioni della Select
+    # --- HELPER FUNCTIONS ---
+
     async def get_enti_options():
-        enti = await asyncio.to_thread(EnteRepo.get_all, '')
-        return {e['ID_ENTE']: f"{e['DESCRIZIONE']} ({e['P_IVA']})" for e in enti}
+        """Recupera la lista enti per la select dal DB reale"""
+        try:
+            enti = await asyncio.to_thread(EnteRepo.get_all, '')
+            # Restituisce dict {ID: "Nome (P.IVA)"}
+            return {e['ID_ENTE']: f"{e['DESCRIZIONE']} ({e['P_IVA']})" for e in enti}
+        except Exception as e:
+            ui.notify(f"Errore caricamento Enti: {e}", color='red')
+            return {}
 
     async def refresh_table():
-        rows = await asyncio.to_thread(UserRepo.get_all, state['search'])
-        
-        # Formattazione data per la tabella (visualizzazione italiana)
-        for r in rows:
-            if r['DATA_NASCITA'] and '-' in r['DATA_NASCITA']:
-                try:
-                    anno, mese, giorno = r['DATA_NASCITA'].split('-')
-                    r['DATA_DISPLAY'] = f"{giorno}-{mese}-{anno}"
-                except:
-                    r['DATA_DISPLAY'] = r['DATA_NASCITA']
-            else:
-                r['DATA_DISPLAY'] = ''
+        """Ricarica la tabella dal DB reale"""
+        try:
+            # 1. Recuperiamo gli utenti
+            rows = await asyncio.to_thread(UserRepo.get_all, state['search'])
+            
+            # 2. Recuperiamo la mappa degli Enti per mostrare il nome nella tabella
+            # (Per evitare di mostrare solo l'ID o il campo società vuoto)
+            opzioni_enti = await get_enti_options()
+            
+            # Formattazione dati per visualizzazione
+            for r in rows:
+                # Formattazione Data (DD-MM-YYYY)
+                if r.get('DATA_NASCITA') and '-' in str(r['DATA_NASCITA']):
+                    try:
+                        d_str = str(r['DATA_NASCITA'])
+                        if ' ' in d_str: d_str = d_str.split(' ')[0]
+                        anno, mese, giorno = d_str.split('-')[:3]
+                        r['DATA_DISPLAY'] = f"{giorno}-{mese}-{anno}"
+                    except:
+                        r['DATA_DISPLAY'] = r['DATA_NASCITA']
+                else:
+                    r['DATA_DISPLAY'] = ''
 
-        if table_ref: table_ref.rows = rows; table_ref.update()
+                # Risoluzione Nome Ente da ID
+                id_ente = r.get('ID_ENTE_FK')
+                # Se l'ID c'è nella mappa usa quello, altrimenti usa stringa vuota o fallback
+                if id_ente in opzioni_enti:
+                    # opzioni_enti è "Nome (Piva)", prendiamo tutto o solo il nome
+                    r['ENTE_DISPLAY'] = opzioni_enti[id_ente]
+                else:
+                    r['ENTE_DISPLAY'] = '-'
+
+            if table_ref: 
+                table_ref.rows = rows
+                table_ref.update()
+        except Exception as e:
+            ui.notify(f"Errore caricamento utenti: {e}", color='red')
 
     async def open_dialog(row=None):
-        # 1. Carichiamo gli enti aggiornati PRIMA di tutto
+        """Apre il dialog Creazione/Modifica"""
+        # Carica opzioni Enti aggiornate
         opzioni_enti = await get_enti_options()
-        # Assicuriamoci che ente_select esista
         if ente_select:
             ente_select.options = opzioni_enti
             ente_select.update()
@@ -1492,118 +1819,189 @@ def gestioneutenti_page():
         dialog_ref.open()
         
         if row:
-            # --- MODALITÀ MODIFICA ---
+            # --- MODIFICA ---
             state['is_new'] = False
+            dialog_label.text = "Modifica Utente"
             
-            # Popoliamo i campi (Ora le variabili esistono sicuramente)
+            # Popolamento campi
             cf_input.value = row['CODICE_FISCALE']
-            cf_input.props('readonly') # CF non si cambia in modifica
+            cf_input.props('readonly') # CF bloccato in modifica
             
             cognome_input.value = row['COGNOME']
             nome_input.value = row['NOME']
-            data_input_field.value = row['DATA_NASCITA'] # Formato YYYY-MM-DD dal DB
+            
+            data_val = str(row['DATA_NASCITA']).split(' ')[0] if row['DATA_NASCITA'] else None
+            data_input_field.value = data_val
+            
             luogo_input.value = row['LUOGO_NASCITA']
+            is_docente_check.value = bool(row.get('IS_DOCENTE', False))
             
-            # Impostiamo l'ente selezionato
-            ente_select.value = row['ID_ENTE_FK']
+            # Gestione Ente
+            current_ente = row.get('ID_ENTE_FK')
+            ente_select.value = current_ente if current_ente in opzioni_enti else None
             
-            dialog_label.text = "Modifica Utente"
         else:
-            # --- MODALITÀ NUOVO ---
+            # --- NUOVO ---
             state['is_new'] = True
-            cf_input.value = ''
-            cf_input.props(remove='readonly') # CF scrivibile
+            dialog_label.text = "Nuovo Utente"
             
+            # Reset campi
+            cf_input.value = ''
+            cf_input.props(remove='readonly') # CF sbloccato
             cognome_input.value = ''
             nome_input.value = ''
-            data_input_field.value = ''
+            data_input_field.value = None
             luogo_input.value = ''
+            is_docente_check.value = False
             ente_select.value = None
-            
-            dialog_label.text = "Nuovo Utente"
 
     async def save_user():
+        """Salva nel DB"""
         if not cf_input.value or not cognome_input.value: 
-            ui.notify('Campi obbligatori mancanti (CF, Cognome)!', type='warning')
+            ui.notify('Codice Fiscale e Cognome obbligatori!', type='warning')
             return
         
-        ente_val = ente_select.value if ente_select.value is not None else ''
+        ente_val = ente_select.value if ente_select.value is not None else None
 
         data = {
             'CODICE_FISCALE': cf_input.value.upper().strip(), 
             'COGNOME': cognome_input.value.strip(),
             'NOME': nome_input.value.strip(), 
             'DATA_NASCITA': data_input_field.value,
-            'LUOGO_NASCITA': luogo_input.value, 
-            'ID_ENTE_FK': ente_val
+            'LUOGO_NASCITA': luogo_input.value.strip() if luogo_input.value else '', 
+            'IS_DOCENTE': is_docente_check.value,
+            'ID_ENTE_FK': ente_val,
+            # Campo SOCIETA rimosso o impostato vuoto se il DB lo richiede ancora
+            'SOCIETA': '' 
         }
         
-        success, msg = await asyncio.to_thread(UserRepo.upsert, data, state['is_new'])
-        if success: 
-            ui.notify(msg, type='positive')
-            dialog_ref.close()
-            await refresh_table()
-        else: 
-            ui.notify(msg, type='negative')
+        try:
+            success, msg = await asyncio.to_thread(UserRepo.upsert, data, state['is_new'])
+            
+            if success: 
+                ui.notify(msg, type='positive')
+                dialog_ref.close()
+                await refresh_table()
+            else: 
+                ui.notify(msg, type='negative')
+        except Exception as e:
+            ui.notify(f"Errore salvataggio: {e}", color='red')
 
-    async def delete_user(row):
-        await asyncio.to_thread(UserRepo.delete, row['CODICE_FISCALE'])
-        ui.notify("Eliminato", type='info'); await refresh_table()
+    # --- LOGICA ELIMINAZIONE ---
+    def open_confirm_delete(row):
+        state['row_to_delete'] = row
+        confirm_dialog.open()
 
-    # --- 3. LAYOUT PAGINA ---
+    async def execute_delete():
+        if not state['row_to_delete']: return
+        row = state['row_to_delete']
+        
+        try:
+            success, msg = await asyncio.to_thread(UserRepo.delete, row['CODICE_FISCALE'])
+            
+            if success:
+                ui.notify("Utente eliminato", type='positive')
+                await refresh_table()
+            else:
+                ui.notify(f"Errore: {msg}", type='negative')
+        except Exception as e:
+            ui.notify(f"Errore eliminazione: {e}", color='red')
+            
+        confirm_dialog.close()
+        state['row_to_delete'] = None
+
+    # --- LAYOUT PAGINA ---
     with ui.column().classes('w-full items-center p-8 max-w-screen-xl mx-auto bg-slate-50 min-h-screen'):
+        
+        # Header
         with ui.row().classes('w-full items-center mb-6 justify-between'):
-            ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense')
-            ui.label('Gestione Utenti').classes('text-3xl font-bold text-slate-800')
-            ui.button('Nuovo', icon='add', on_click=lambda: open_dialog(None)).props('unelevated color=primary')
+            with ui.row().classes('items-center gap-4'):
+                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense text-color=slate-700')
+                ui.label('Gestione Utenti').classes('text-3xl font-bold text-slate-800')
+            
+            ui.button('Nuovo Utente', icon='person_add', on_click=lambda: open_dialog(None)).props('unelevated color=primary')
 
+        # Barra Ricerca
         with ui.card().classes('w-full p-2 mb-4 flex flex-row items-center gap-4'):
             ui.icon('search').classes('text-grey ml-2')
-            ui.input(placeholder='Cerca...').classes('flex-grow').props('borderless').bind_value(state, 'search').on('keydown.enter', refresh_table)
+            ui.input(placeholder='Cerca per cognome o CF...').classes('flex-grow').props('borderless').bind_value(state, 'search').on('keydown.enter', refresh_table)
             ui.button('Cerca', on_click=refresh_table).props('flat color=primary')
 
+        # Tabella
         cols = [
-            {'name': 'CODICE_FISCALE', 'label': 'CF', 'field': 'CODICE_FISCALE', 'align': 'left', 'sortable': True},
-            {'name': 'COGNOME', 'label': 'Cognome', 'field': 'COGNOME', 'sortable': True, 'align': 'left'},
-            {'name': 'NOME', 'label': 'Nome', 'field': 'NOME', 'align': 'left'},
-            {'name': 'DATA_NASCITA', 'label': 'Data', 'field': 'DATA_DISPLAY', 'align': 'center'}, # Usiamo il campo formattato
-            {'name': 'ID_ENTE_FK', 'label': 'ID Ente', 'field': 'ID_ENTE_FK', 'align': 'center'},
+            {'name': 'CODICE_FISCALE', 'label': 'CF', 'field': 'CODICE_FISCALE', 'align': 'left', 'sortable': True, 'classes': 'font-mono text-xs'},
+            {'name': 'COGNOME', 'label': 'Cognome', 'field': 'COGNOME', 'sortable': True, 'align': 'left', 'classes': 'font-bold'},
+            {'name': 'NOME', 'label': 'Nome', 'field': 'NOME', 'align': 'left', 'classes': 'font-bold'},
+            {'name': 'DATA_NASCITA', 'label': 'Data', 'field': 'DATA_DISPLAY', 'align': 'center'}, 
+            # Modificato per mostrare il nome dell'Ente invece del campo Società libero
+            {'name': 'ENTE_DISPLAY', 'label': 'Ente / Azienda', 'field': 'ENTE_DISPLAY', 'align': 'left'},
+            {'name': 'IS_DOCENTE', 'label': 'Ruolo', 'field': 'IS_DOCENTE', 'align': 'center'},
             {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
         ]
+        
         table_ref = ui.table(columns=cols, rows=[], row_key='CODICE_FISCALE').classes('w-full shadow-md bg-white')
+        
+        # Slot Badge Docente
+        table_ref.add_slot('body-cell-IS_DOCENTE', r'''
+            <q-td key="IS_DOCENTE" :props="props">
+                <q-badge :color="props.value ? 'purple' : 'grey'" :label="props.value ? 'DOCENTE' : 'CORSISTA'" outline />
+            </q-td>
+        ''')
+
+        # Slot Azioni
         table_ref.add_slot('body-cell-azioni', r'''
             <q-td key="azioni" :props="props">
                 <q-btn icon="edit" size="sm" round flat color="grey-8" @click="$parent.$emit('edit', props.row)" />
                 <q-btn icon="delete" size="sm" round flat color="red" @click="$parent.$emit('delete', props.row)" />
             </q-td>
         ''')
+        
         table_ref.on('edit', lambda e: open_dialog(e.args))
-        table_ref.on('delete', lambda e: delete_user(e.args))
+        table_ref.on('delete', lambda e: open_confirm_delete(e.args))
+        
         ui.timer(0.1, refresh_table, once=True)
 
-    # --- 4. DIALOGO E CREAZIONE INPUT ---
+    # --- DIALOG EDIT/NEW ---
     with ui.dialog() as dialog_ref, ui.card().classes('w-full max-w-2xl p-0 rounded-xl overflow-hidden'):
+        
+        # Header Dialogo
         with ui.row().classes('w-full bg-primary text-white p-4 items-center justify-between'):
             dialog_label = ui.label('Utente').classes('text-lg font-bold')
             ui.button(icon='close', on_click=dialog_ref.close).props('flat round dense text-white')
         
         with ui.column().classes('w-full p-6 gap-4'):
-            with ui.row().classes('w-full gap-4'):
-                # Assegnazione alle variabili inizializzate all'inizio
-                cf_input = ui.input('CF').props('outlined dense uppercase').classes('w-full md:w-1/2')
-                ente_select = ui.select(options={}, with_input=True, label='Seleziona Ente') \
-                    .props('outlined dense use-input input-debounce="0" behavior="menu"') \
-                    .classes('w-full md:w-1/2')
+            
+            # Riga 1: CF e Docente
+            with ui.row().classes('w-full gap-4 items-center'):
+                cf_input = ui.input('Codice Fiscale *').props('outlined dense uppercase mask="AAAAAAAAAAAAAAAA"').classes('w-full md:w-1/2')
+                is_docente_check = ui.checkbox('Abilita come Docente').classes('text-purple-600 font-bold')
 
+            # Riga 2: Anagrafica
             with ui.row().classes('w-full gap-4'):
-                cognome_input = ui.input('Cognome').props('outlined dense').classes('w-full md:w-1/2')
-                nome_input = ui.input('Nome').props('outlined dense').classes('w-full md:w-1/2')
+                cognome_input = ui.input('Cognome *').props('outlined dense').classes('w-full md:w-1/2')
+                nome_input = ui.input('Nome *').props('outlined dense').classes('w-full md:w-1/2')
+            
+            # Riga 3: Dati Nascita
             with ui.row().classes('w-full gap-4'):
-                # Usiamo tipo 'date' per avere il calendario nativo
                 data_input_field = ui.input('Data (YYYY-MM-DD)').props('outlined dense type=date').classes('w-full md:w-1/3')
                 luogo_input = ui.input('Luogo Nascita').props('outlined dense').classes('w-full md:w-2/3')
             
-            ui.button('Salva', on_click=save_user).props('unelevated color=primary w-full')
+            # Riga 4: Solo Ente (Rimosso Società input libero)
+            ente_select = ui.select(options={}, with_input=True, label='Ente di Appartenenza') \
+                .props('outlined dense use-input behavior="menu" clearable') \
+                .classes('w-full')
+
+            ui.separator().classes('mt-4')
+            ui.button('Salva Utente', on_click=save_user).props('unelevated color=primary w-full icon=save')
+
+    # --- DIALOG CONFERMA ELIMINAZIONE ---
+    with ui.dialog() as confirm_dialog, ui.card().classes('p-6 items-center text-center'):
+        ui.icon('warning', size='xl').classes('text-red-500 mb-2')
+        ui.label('Confermi eliminazione?').classes('text-xl font-bold text-slate-800')
+        ui.label('L\'utente verrà rimosso permanentemente.').classes('text-gray-600 mb-4')
+        with ui.row().classes('gap-4'):
+            ui.button('Annulla', on_click=confirm_dialog.close).props('flat color=grey')
+            ui.button('Elimina', on_click=execute_delete).props('unelevated color=red')
 
 @ui.page('/gestioneenti')
 def gestioneenti_page():
@@ -1829,6 +2227,412 @@ def gestionedocenti_page():
                 data_input_field = ui.input('Data Nascita').props('outlined dense').classes('w-full md:w-1/3')
                 luogo_input = ui.input('Luogo Nascita').props('outlined dense').classes('w-full md:w-2/3')
             ui.button('Salva Docente', on_click=save_docente).props('unelevated color=primary w-full')
+
+@ui.page('/archivio')
+def archivio_page():
+    if not app.storage.user.get('authenticated', False): 
+        ui.navigate.to('/'); return
+
+    state = {'search': '', 'date_start': None, 'date_end': None}
+    table_ref = None
+
+    # --- HELPER ---
+    def format_date(dt_obj):
+        """Formatta date o stringhe in DD/MM/YYYY"""
+        if not dt_obj: return '-'
+        try:
+            if isinstance(dt_obj, str):
+                return datetime.strptime(dt_obj, '%Y-%m-%d').strftime('%d/%m/%Y')
+            return dt_obj.strftime('%d/%m/%Y')
+        except: return str(dt_obj)
+
+    # --- LOGICA EXPORT EXCEL/CSV ---
+    async def export_excel():
+        """Genera un file CSV (Excel compatibile) con i dati filtrati"""
+        try:
+            # 1. Recupera dati (con gli stessi filtri della tabella)
+            rows = await asyncio.to_thread(AttestatiRepo.get_history, state['search'], state['date_start'], state['date_end'])
+            
+            if not rows:
+                ui.notify("Nessun dato da esportare", color='warning')
+                return
+
+            # 2. Crea file temporaneo
+            # 'utf-8-sig' è fondamentale per far leggere gli accenti a Excel
+            # 'delete=False' perché NiceGUI deve poterlo leggere per inviarlo
+            with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv', encoding='utf-8-sig', newline='') as tmp:
+                # Usa ';' come delimitatore perché Excel italiano lo preferisce alla virgola
+                writer = csv.writer(tmp, delimiter=';')
+                
+                # Intestazioni
+                writer.writerow(['ID', 'Data Emissione', 'Corsista', 'Codice Fiscale', 'Corso', 'Scadenza', 'Stato'])
+                
+                today = date.today()
+                
+                # Scrittura righe
+                for r in rows:
+                    # Formattazione dati
+                    d_em = format_date(r.get('DATA_EMISSIONE'))
+                    d_sc = format_date(r.get('SCADENZA'))
+                    
+                    # Calcolo Stato (Testuale per Excel)
+                    stato_str = "SCADUTO"
+                    try:
+                        scad_val = r.get('SCADENZA')
+                        if scad_val:
+                            if isinstance(scad_val, str):
+                                scad_obj = datetime.strptime(scad_val, '%Y-%m-%d').date()
+                            elif isinstance(scad_val, datetime):
+                                scad_obj = scad_val.date()
+                            else:
+                                scad_obj = scad_val
+                            
+                            if scad_obj > today:
+                                stato_str = "VALIDO"
+                    except:
+                        pass # Resta Scaduto se errore
+
+                    writer.writerow([
+                        r.get('ID', ''),
+                        d_em,
+                        r.get('CORSISTA', ''),
+                        r.get('CF', ''),
+                        r.get('CORSO', ''),
+                        d_sc,
+                        stato_str
+                    ])
+                
+                tmp_path = tmp.name
+
+            # 3. Avvia Download
+            ui.download(tmp_path, 'Archivio_Attestati.csv')
+            ui.notify("Export completato!", color='green')
+
+        except Exception as e:
+            ui.notify(f"Errore Export: {e}", color='red')
+
+    # --- LOGICA TABELLA ---
+    async def refresh_table():
+        try:
+            rows = await asyncio.to_thread(AttestatiRepo.get_history, state['search'], state['date_start'], state['date_end'])
+            
+            today = date.today()
+
+            for r in rows:
+                r['DATA_FMT'] = format_date(r.get('DATA_EMISSIONE'))
+                r['SCADENZA_FMT'] = format_date(r.get('SCADENZA'))
+                
+                # Calcolo validità per Badge
+                r['VALIDO'] = False 
+                try:
+                    scad_val = r.get('SCADENZA')
+                    if scad_val:
+                        if isinstance(scad_val, str):
+                            scad = datetime.strptime(scad_val, '%Y-%m-%d').date()
+                        elif isinstance(scad_val, datetime):
+                            scad = scad_val.date()
+                        else:
+                            scad = scad_val 
+                        
+                        if scad and scad > today:
+                            r['VALIDO'] = True
+                except Exception as e:
+                    print(f"Errore calcolo validità riga {r.get('ID')}: {e}")
+
+            if table_ref: 
+                table_ref.rows = rows
+                table_ref.update()
+        except Exception as e:
+            ui.notify(f"Errore caricamento storico: {e}", color='red')
+
+    # --- LAYOUT ---
+    with ui.column().classes('w-full items-center p-8 max-w-screen-xl mx-auto bg-slate-50 min-h-screen'):
+        
+        with ui.row().classes('w-full items-center mb-6 justify-between'):
+            with ui.row().classes('items-center gap-4'):
+                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense text-color=slate-700')
+                ui.label('Archivio Attestati').classes('text-3xl font-bold text-slate-800')
+                ui.icon('history', size='lg').classes('text-slate-400')
+
+            # Bottone collegato alla funzione export_excel
+            ui.button('Esporta Excel', icon='file_download', on_click=export_excel).props('outline color=green')
+
+        with ui.card().classes('w-full p-4 mb-6 grid grid-cols-1 md:grid-cols-4 gap-4 items-end bg-white shadow-sm'):
+            ui.input('Cerca...').props('outlined dense').classes('md:col-span-2').bind_value(state, 'search').on('keydown.enter', refresh_table)
+            ui.input('Dal...').props('outlined dense type=date').bind_value(state, 'date_start')
+            ui.button('Filtra', icon='filter_list', on_click=refresh_table).props('unelevated color=primary')
+
+        cols = [
+            {'name': 'DATA_FMT', 'label': 'Data', 'field': 'DATA_FMT', 'align': 'left', 'sortable': True},
+            {'name': 'CORSISTA', 'label': 'Corsista', 'field': 'CORSISTA', 'align': 'left', 'sortable': True, 'classes': 'font-bold'},
+            {'name': 'CF', 'label': 'CF', 'field': 'CF', 'align': 'left', 'classes': 'font-mono text-xs'},
+            {'name': 'CORSO', 'label': 'Corso', 'field': 'CORSO', 'align': 'left'},
+            {'name': 'SCADENZA_FMT', 'label': 'Scadenza', 'field': 'SCADENZA_FMT', 'align': 'center'},
+            {'name': 'status', 'label': 'Stato', 'field': 'status', 'align': 'center'},
+        ]
+        
+        table_ref = ui.table(columns=cols, rows=[], row_key='ID').classes('w-full shadow-md bg-white')
+
+        table_ref.add_slot('body-cell-status', r'''
+            <q-td key="status" :props="props">
+                <q-badge :color="props.row.VALIDO ? 'green' : 'red'" 
+                         :label="props.row.VALIDO ? 'VALIDO' : 'SCADUTO'" />
+            </q-td>
+        ''')
+        
+        ui.timer(0.1, refresh_table, once=True)
+
+@ui.page('/scadenzario')
+def scadenzario_page():
+    if not app.storage.user.get('authenticated', False): 
+        ui.navigate.to('/'); return
+
+    # Stato
+    state = {
+        'days_lookahead': 60, 
+        'search': '',
+        'filter_mode': 'in_scadenza',
+        # --- STATO PER LA MAIL ---
+        'mail_to': '',
+        'mail_subject': '',
+        'mail_body': ''
+    }
+    table_ref = None
+    email_dialog = None # Riferimento al popup
+
+    # --- HELPER ---
+    def format_date(dt_obj):
+        if not dt_obj: return '-'
+        try:
+            if isinstance(dt_obj, str): 
+                dt_obj = datetime.strptime(dt_obj, '%Y-%m-%d')
+            return dt_obj.strftime('%d/%m/%Y')
+        except: return str(dt_obj)
+
+    # --- LOGICA GESTIONE MAIL ---
+    def open_email_dialog(e):
+        """Apre la finestra per comporre la mail con dati precompilati"""
+        row = e.args
+        corsista = row.get('CORSISTA', 'Dipendente') # Contiene già "Cognome Nome"
+        corso = row.get('CORSO', 'Corso')
+        scadenza = row.get('SCADENZA_FMT', 'Data ignota')
+        
+        # Recuperiamo il nome Ente se disponibile nella riga, altrimenti generico
+        ente_nome = row.get('ENTE', 'Spett.le Azienda')
+        
+        # 1. Precompila i campi
+        state['mail_to'] = '' 
+        state['mail_subject'] = f"Rinnovo Corso: {corso} - {corsista}"
+        
+        # Template del messaggio AGGIORNATO
+        state['mail_body'] = (
+            f"Gentile {ente_nome},\n\n"
+            f"Ti ricordiamo che l'attestato di {corsista} per il corso di formazione '{corso}' "
+            f"risulta in scadenza il {scadenza}.\n\n"
+            "Per mantenere la validità della certificazione, è necessario programmare il corso di aggiornamento.\n"
+            "Restiamo a disposizione per organizzare le date.\n\n"
+            "Cordiali saluti,\n"
+            "Segreteria Formazione"
+        )
+        
+        # 2. Apre il popup
+        email_dialog.open()
+
+    async def send_email_action():
+        """
+        Funzione che invia effettivamente la mail tramite SMTP.
+        """
+        destinatario = state['mail_to']
+        oggetto = state['mail_subject']
+        corpo = state['mail_body']
+
+        if not destinatario:
+            ui.notify("Inserisci un indirizzo email destinatario!", type='warning')
+            return
+
+        # --- CONFIGURAZIONE MITTENTE (DA COMPILARE) ---
+        # Se usi Gmail, devi generare una "App Password" nelle impostazioni di sicurezza Google
+        SMTP_SERVER = "smtp.gmail.com"
+        SMTP_PORT = 587
+        SENDER_EMAIL = "lorenzo.ricci.onaws@gmail.com" # <--- INSERISCI QUI LA TUA EMAIL
+        SENDER_PASSWORD = "Occhiali28!" # <--- INSERISCI QUI LA TUA PASSWORD
+        
+        # Feedback visivo
+        ui.notify("Connessione al server di posta...", spinner=True)
+        
+        try:
+            # Eseguiamo l'invio in un thread separato per non bloccare l'interfaccia
+            def invia_reale():
+                msg = MIMEMultipart()
+                msg['From'] = SENDER_EMAIL
+                msg['To'] = destinatario
+                msg['Subject'] = oggetto
+                msg.attach(MIMEText(corpo, 'plain'))
+
+                server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+                server.starttls() # Sicurezza TLS
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                text = msg.as_string()
+                server.sendmail(SENDER_EMAIL, destinatario, text)
+                server.quit()
+
+            await asyncio.to_thread(invia_reale)
+            
+            ui.notify(f"Email inviata correttamente a {destinatario}!", type='positive')
+            email_dialog.close()
+
+        except Exception as e:
+            ui.notify(f"Errore invio: {e}", color='red', multi_line=True)
+
+    # --- LOGICA RECUPERO DATI ---
+    async def refresh_table():
+        try:
+            all_rows = await asyncio.to_thread(AttestatiRepo.get_history, state['search'])
+            
+            if not all_rows:
+                if table_ref: table_ref.update()
+                return
+
+            today = date.today()
+            limit_date = today + timedelta(days=int(state['days_lookahead']))
+            
+            filtered_rows = []
+            
+            for r in all_rows:
+                scad_obj = None
+                try:
+                    raw = r.get('SCADENZA')
+                    if raw:
+                        if isinstance(raw, str): 
+                            scad_obj = datetime.strptime(raw, '%Y-%m-%d').date()
+                        elif isinstance(raw, datetime):
+                            scad_obj = raw.date()
+                        elif isinstance(raw, date): 
+                            scad_obj = raw
+                except: pass
+
+                if not scad_obj: continue 
+
+                include = False
+                days_left = (scad_obj - today).days
+                
+                if state['filter_mode'] == 'scaduti':
+                    if days_left < 0: include = True
+                elif state['filter_mode'] == 'in_scadenza':
+                    if -60 <= days_left <= state['days_lookahead']: include = True
+                else: 
+                    include = True
+
+                if include:
+                    r['GIORNI_RIMASTI'] = days_left
+                    r['SCADENZA_FMT'] = format_date(scad_obj)
+                    
+                    if days_left < 0:
+                        r['STATUS_COLOR'] = 'red'
+                        r['STATUS_LABEL'] = f'SCADUTO da {abs(days_left)} gg'
+                    elif days_left <= 30:
+                        r['STATUS_COLOR'] = 'orange'
+                        r['STATUS_LABEL'] = f'Scade tra {days_left} gg'
+                    else:
+                        r['STATUS_COLOR'] = 'green'
+                        r['STATUS_LABEL'] = f'Scade tra {days_left} gg'
+                    
+                    filtered_rows.append(r)
+
+            filtered_rows.sort(key=lambda x: x['GIORNI_RIMASTI'])
+
+            if table_ref: 
+                table_ref.rows = filtered_rows
+                table_ref.update()
+                
+        except Exception as e:
+            ui.notify(f"Errore caricamento scadenze: {e}", color='red')
+
+    # --- LAYOUT ---
+    with ui.column().classes('w-full items-center p-8 bg-slate-50 min-h-screen'):
+        
+        # Header
+        with ui.row().classes('w-full items-center mb-6 justify-between max-w-screen-xl'):
+            with ui.row().classes('items-center gap-4'):
+                ui.button(icon='arrow_back', on_click=lambda: ui.navigate.to('/dashboard')).props('flat round dense text-color=slate-700')
+                ui.label('Scadenzario Corsi').classes('text-3xl font-bold text-slate-800')
+                ui.icon('alarm', size='lg').classes('text-orange-500')
+            
+            with ui.row().classes('gap-4'):
+                ui.badge('Controlla regolarmente!', color='orange').props('outline')
+
+        # Barra Strumenti
+        with ui.card().classes('w-full p-4 mb-6 flex flex-wrap items-center gap-4 bg-white shadow-sm max-w-screen-xl'):
+            with ui.button_group().props('unelevated'):
+                ui.button('In Scadenza', on_click=lambda: (state.update({'filter_mode': 'in_scadenza'}), refresh_table())).props('color=orange')
+                ui.button('Già Scaduti', on_click=lambda: (state.update({'filter_mode': 'scaduti'}), refresh_table())).props('color=red')
+                ui.button('Tutto', on_click=lambda: (state.update({'filter_mode': 'tutti'}), refresh_table())).props('color=grey')
+
+            ui.separator().props('vertical')
+
+            with ui.row().classes('items-center gap-2'):
+                ui.label('Orizzonte temporale:').classes('text-sm text-gray-600')
+                slider = ui.slider(min=30, max=365, step=30, value=60).props('label-always color=primary').classes('w-48')
+                slider.bind_value(state, 'days_lookahead')
+                slider.on('change', refresh_table)
+                ui.label('giorni').classes('text-sm')
+
+            ui.separator().props('vertical')
+            ui.input('Cerca Azienda o Corsista').props('outlined dense').classes('flex-grow').bind_value(state, 'search').on('keydown.enter', refresh_table)
+            ui.button(icon='refresh', on_click=refresh_table).props('flat round')
+
+        # Tabella
+        cols = [
+            {'name': 'SCADENZA_FMT', 'label': 'Data Scadenza', 'field': 'SCADENZA_FMT', 'align': 'left', 'sortable': True},
+            {'name': 'status', 'label': 'Stato', 'field': 'status', 'align': 'left'},
+            {'name': 'CORSISTA', 'label': 'Corsista', 'field': 'CORSISTA', 'align': 'left', 'sortable': True, 'classes': 'font-bold'},
+            {'name': 'CORSO', 'label': 'Corso da Rinnovare', 'field': 'CORSO', 'align': 'left'},
+            {'name': 'CF', 'label': 'CF', 'field': 'CF', 'align': 'left', 'classes': 'text-xs text-gray-500'},
+            {'name': 'azioni', 'label': '', 'field': 'azioni', 'align': 'right'},
+        ]
+        
+        table_ref = ui.table(columns=cols, rows=[], row_key='ID').classes('w-full shadow-md bg-white max-w-screen-xl')
+
+        table_ref.add_slot('body-cell-status', r'''
+            <q-td key="status" :props="props">
+                <q-chip :color="props.row.STATUS_COLOR" text-color="white" dense>
+                    {{ props.row.STATUS_LABEL }}
+                </q-chip>
+            </q-td>
+        ''')
+
+        table_ref.add_slot('body-cell-azioni', r'''
+            <q-td key="azioni" :props="props">
+                <q-btn icon="mail" label="Avvisa" size="sm" flat color="primary" @click="$parent.$emit('email', props.row)" />
+            </q-td>
+        ''')
+        
+        # Collegamento evento apertura dialog
+        table_ref.on('email', open_email_dialog)
+        
+        ui.timer(0.1, refresh_table, once=True)
+
+    # --- DIALOG INVIO EMAIL (NUOVO) ---
+    with ui.dialog() as email_dialog, ui.card().classes('w-full max-w-2xl p-6 gap-4'):
+        
+        # Intestazione
+        with ui.row().classes('w-full items-center justify-between mb-2'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('send', size='md').classes('text-primary')
+                ui.label('Invia Avviso Scadenza').classes('text-xl font-bold text-slate-800')
+            ui.button(icon='close', on_click=email_dialog.close).props('flat round dense color=grey')
+
+        # Form
+        ui.input('Destinatario (Email)').bind_value(state, 'mail_to').props('outlined dense type=email').classes('w-full')
+        ui.input('Oggetto').bind_value(state, 'mail_subject').props('outlined dense').classes('w-full font-bold')
+        
+        ui.label('Testo del messaggio:').classes('text-sm text-gray-500 mt-2')
+        ui.textarea().bind_value(state, 'mail_body').props('outlined dense rows=10').classes('w-full')
+
+        # Footer
+        with ui.row().classes('w-full justify-end mt-4 gap-2'):
+            ui.button('Annulla', on_click=email_dialog.close).props('flat color=grey')
+            ui.button('Invia Email', on_click=send_email_action).props('unelevated color=primary icon=send')
 
 if __name__ in {"__main__", "__mp_main__"}:
     ui.run(title="WorkSafeManager", storage_secret='secret_key', reload=True ,port=8001)
