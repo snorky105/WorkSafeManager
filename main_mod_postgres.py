@@ -1058,20 +1058,43 @@ def gestionecorsi_page():
 
     async def handle_template_upload(e):
         try:
-            original_filename = e.name or "upload.docx"
-            original_filename = os.path.basename(original_filename).replace('\\', '').replace('/', '')
-            target_path = os.path.join(ABSOLUTE_PATH_TO_TEMPLATES, original_filename)
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            with open(target_path, 'wb') as f: f.write(e.content.read())
-            
-            ui.notify(f"Caricato: {original_filename}", color='green')
-            if template_select:
-                template_select.options = get_template_files()
-                template_select.value = original_filename
-                template_select.update()
-        except Exception as err:
-            ui.notify(f"Errore upload: {err}", color='red')
+            # 1. RECUPERO DEL NOME ORIGINALE
+            # e.name contiene esattamente il nome del file sul tuo PC (es. "Corso_Sicurezza_2024.docx")
+            if not e.name:
+                ui.notify("Errore: Il file non ha un nome valido.", type='warning')
+                return
 
+            # 'os.path.basename' serve per sicurezza (pulisce eventuali percorsi assoluti inviati da browser vecchi)
+            filename = os.path.basename(e.name)
+            
+            # 2. PERCORSO DI SALVATAGGIO
+            target_path = os.path.join(ABSOLUTE_PATH_TO_TEMPLATES, filename)
+            
+            # Crea la cartella templates se non esiste
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            
+            # 3. SALVATAGGIO DEL CONTENUTO
+            # .seek(0) riporta il cursore all'inizio del file per leggerlo tutto
+            e.content.seek(0)
+            with open(target_path, 'wb') as f:
+                f.write(e.content.read())
+            
+            ui.notify(f"Caricato con successo: {filename}", type='positive')
+            
+            # 4. AGGIORNAMENTO UI
+            # Ricarichiamo la lista e selezioniamo subito il file appena caricato
+            if template_select:
+                template_select.options = get_template_files() # Rilegge la cartella
+                template_select.value = filename               # Imposta il valore al file nuovo
+                template_select.update()                       # Aggiorna la grafica
+                
+        except AttributeError:
+            # Questo errore esce SOLO se manca la libreria python-multipart
+            ui.notify("Errore critico: Manca la libreria 'python-multipart'. Installala con pip.", type='negative')
+        except Exception as err:
+            ui.notify(f"Errore imprevisto: {str(err)}", type='negative')
+            print(f"DEBUG UPLOAD ERROR: {err}")
+            
     # --- LOGICA ---
     async def refresh_table():
         rows = await asyncio.to_thread(CorsoRepo.get_all, state['search'])
