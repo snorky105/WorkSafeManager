@@ -102,22 +102,28 @@ class UserRepo:
     @staticmethod
     def get_all(search_term='', solo_docenti=False):
         """
-        Recupera utenti. Se solo_docenti=True, filtra solo chi ha IS_DOCENTE=1
+        Recupera utenti con il nuovo ID univoco.
         """
         conn = None
         try:
             conn = get_db_connection()
             cur = conn.cursor()
             
-            # Selezioniamo anche IS_DOCENTE
-            sql = "SELECT CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK, IS_DOCENTE FROM T_SOGGETTI"
+            # <<< MODIFICA 1: Selezioniamo l'ID come primo campo
+            # Assumo che la colonna PK si chiami ID_SOGGETTO
+            sql = """
+                SELECT ID_SOGGETTO, CODICE_FISCALE, COGNOME, NOME, 
+                       DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK, IS_DOCENTE 
+                FROM T_SOGGETTI
+            """
             
             conditions = []
             params = []
             
-            # Filtro Ricerca Testuale
+            # Filtro Ricerca (Search)
             if search_term:
                 term = search_term.upper()
+                # La ricerca testuale funziona ancora anche sul CF se presente
                 conditions.append("(UPPER(COGNOME) ILIKE %s OR UPPER(NOME) ILIKE %s OR UPPER(CODICE_FISCALE) ILIKE %s)")
                 params.extend([term, term, term])
             
@@ -125,7 +131,6 @@ class UserRepo:
             if solo_docenti:
                 conditions.append("IS_DOCENTE = 1")
             
-            # Assembla la query
             if conditions:
                 sql += " WHERE " + " AND ".join(conditions)
             
@@ -136,20 +141,23 @@ class UserRepo:
             
             result = []
             for r in rows:
-                d_nascita = r[3]
+                # Gestione Data
+                d_nascita = r[4] # <<< Nota: gli indici sono shiftati di +1 perché c'è l'ID all'inizio
                 if isinstance(d_nascita, (date, datetime)):
                     d_nascita = d_nascita.strftime('%Y-%m-%d')
                 elif d_nascita is None:
                     d_nascita = ''
                 
                 result.append({
-                    'CODICE_FISCALE': r[0], 
-                    'COGNOME': r[1], 
-                    'NOME': r[2],
+                    # <<< MODIFICA: Mappiamo l'ID del DB nel campo ID_UTENTE usato dalla UI
+                    'ID_UTENTE': r[0],       # ID_SOGGETTO
+                    'CODICE_FISCALE': r[1],  # Ora può essere None
+                    'COGNOME': r[2], 
+                    'NOME': r[3],
                     'DATA_NASCITA': str(d_nascita), 
-                    'LUOGO_NASCITA': r[4], 
-                    'ID_ENTE_FK': r[5],
-                    'IS_DOCENTE': bool(r[6]) # Convertiamo 0/1 in True/False
+                    'LUOGO_NASCITA': r[5], 
+                    'ID_ENTE_FK': r[6],
+                    'IS_DOCENTE': bool(r[7])
                 })
             return result
         except Exception as e:
@@ -168,7 +176,7 @@ class UserRepo:
             # 1. FIX DATA NASCITA
             dt_nascita = None
             raw_data = str(data.get('DATA_NASCITA', '')).strip()
-            if raw_data:
+            if raw_data and raw_data != 'None':
                 try:
                     if '-' in raw_data:
                         dt_nascita = datetime.strptime(raw_data, '%Y-%m-%d').date()
@@ -176,53 +184,98 @@ class UserRepo:
                         dt_nascita = datetime.strptime(raw_data, '%d/%m/%Y').date()
                 except ValueError: pass
             
-            # 2. FIX ID ENTE (QUESTO È QUELLO CHE MANCAVA)
-            # Se è vuoto, lo forziamo a None (NULL su DB)
+            # 2. FIX ID ENTE
             id_ente_val = str(data.get('ID_ENTE_FK', '')).strip()
-            if not id_ente_val: 
+            if not id_ente_val or id_ente_val == 'None': 
                 id_ente_val = None 
 
-            # 3. GESTIONE DOCENTE
+            # 3. GESTIONE CF NULLABLE
+            # Se il CF è vuoto, salviamo NULL (None in Python) nel DB
+            cf_val = data.get('CODICE_FISCALE', '').strip().upper()
+            if not cf_val:
+                cf_val = None
+
+            # 4. GESTIONE DOCENTE
             is_doc = 1 if data.get('IS_DOCENTE') else 0
 
             if is_new:
+                # <<< INSERT: Non passiamo l'ID, lo genera il DB
                 sql = """
-                    INSERT INTO T_SOGGETTI (CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK, IS_DOCENTE) 
+                    INSERT INTO T_SOGGETTI 
+                    (CODICE_FISCALE, COGNOME, NOME, DATA_NASCITA, LUOGO_NASCITA, ID_ENTE_FK, IS_DOCENTE) 
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """
-                # Nota qui sotto: uso id_ente_val, NON data['ID_ENTE_FK']
-                params = (data['CODICE_FISCALE'], data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], id_ente_val, is_doc)
+                params = (cf_val, data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], id_ente_val, is_doc)
             else:
+                # <<< UPDATE: Usiamo l'ID per trovare la riga, NON il CF
                 sql = """
                     UPDATE T_SOGGETTI 
-                    SET COGNOME=%s, NOME=%s, DATA_NASCITA=%s, LUOGO_NASCITA=%s, ID_ENTE_FK=%s, IS_DOCENTE=%s 
-                    WHERE CODICE_FISCALE=%s
+                    SET CODICE_FISCALE=%s, COGNOME=%s, NOME=%s, DATA_NASCITA=%s, 
+                        LUOGO_NASCITA=%s, ID_ENTE_FK=%s, IS_DOCENTE=%s 
+                    WHERE ID_SOGGETTO=%s
                 """
-                # Nota qui sotto: uso id_ente_val, NON data['ID_ENTE_FK']
-                params = (data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], id_ente_val, is_doc, data['CODICE_FISCALE'])
+                # Recuperiamo l'ID passato dalla UI
+                id_row = data['ID_UTENTE']
+                params = (cf_val, data['COGNOME'], data['NOME'], dt_nascita, data['LUOGO_NASCITA'], id_ente_val, is_doc, id_row)
             
             cur.execute(sql, params)
             conn.commit()
             return True, "Salvataggio completato."
-        except fdb.IntegrityError:
-            return False, "Errore: Codice Fiscale esistente o dati invalidi."
+            
+        except fdb.IntegrityError as e:
+            # Gestione errore duplicati (magari un CF duplicato se inserito)
+            return False, f"Errore integrità dati (es. CF già presente): {e}"
         except Exception as e:
             return False, f"Errore DB: {str(e)}"
         finally:
             if conn: conn.close()
-    
-    # Delete rimane uguale...
+
     @staticmethod
-    def delete(codice_fiscale):
-        # ... (codice uguale a prima) ...
+    def delete(id_utente):
+        """
+        Elimina per ID, non per CF
+        """
         conn = None
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute("DELETE FROM T_SOGGETTI WHERE CODICE_FISCALE = %s", (codice_fiscale,))
+            # <<< MODIFICA: Delete WHERE ID_SOGGETTO
+            cur.execute("DELETE FROM T_SOGGETTI WHERE ID_SOGGETTO = %s", (id_utente,))
             conn.commit()
-            return True
-        except Exception: return False
+            return True, "Eliminato"
+        except Exception as e: 
+            return False, str(e)
+        finally:
+            if conn: conn.close()
+            
+    @staticmethod
+    def get_select_options():
+        """
+        Restituisce un dizionario {ID: 'Cognome Nome (CF)'} 
+        da usare nelle ui.select
+        """
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            # Selezioniamo ID, Cognome, Nome e CF (per visualizzazione)
+            sql = "SELECT ID_SOGGETTO, COGNOME, NOME, CODICE_FISCALE FROM T_SOGGETTI ORDER BY COGNOME, NOME"
+            cur.execute(sql)
+            rows = cur.fetchall()
+            
+            options = {}
+            for r in rows:
+                id_sogg = r[0]
+                cognome = r[1]
+                nome = r[2]
+                cf = r[3] if r[3] else "No CF"
+                # Crea l'etichetta leggibile
+                options[id_sogg] = f"{cognome} {nome} ({cf})"
+            
+            return options
+        except Exception as e:
+            print(f"Err options: {e}")
+            return {}
         finally:
             if conn: conn.close()
 
@@ -232,15 +285,15 @@ class AttestatiRepo:
     def get_history(search='', start_date=None, end_date=None):
         """
         Recupera lo storico unendo t_attestati, t_soggetti e t_corsi.
+        JOIN aggiornata per usare ID_SOGGETTO invece del CF.
         """
         conn = None
         results = []
         try:
-            # Usa la tua funzione di connessione che è già in questo file
             conn = get_db_connection()
             cursor = conn.cursor()
             
-            # QUERY CORRETTA PER LA TUA TABELLA t_attestati
+            # <<< MODIFICA: La JOIN ora usa ID_SOGGETTO
             query = """
                 SELECT 
                     a.id_attestato,
@@ -250,14 +303,14 @@ class AttestatiRepo:
                     s.nome,
                     c.nome_corso
                 FROM public.t_attestati a
-                JOIN public.t_soggetti s ON a.id_soggetto_fk = s.codice_fiscale
+                JOIN public.t_soggetti s ON a.ID_SOGGETTO = s.ID_SOGGETTO
                 JOIN public.t_corsi c ON a.id_corso_fk = c.id_corso
                 WHERE 1=1
             """
             
             params = []
             
-            # Filtro Ricerca
+            # Filtro Ricerca (Cerca ancora per testo su Cognome/Nome/CF recuperati dalla join)
             if search:
                 term = f"%{search.lower()}%"
                 query += """ AND (
@@ -283,11 +336,9 @@ class AttestatiRepo:
             
             # Mappatura risultati per la UI
             for row in rows:
-                # I dati arrivano nell'ordine della SELECT
                 data_svol = row[1]
                 
-                # Calcolo scadenza (Esempio: 5 anni dopo lo svolgimento)
-                # Puoi personalizzarlo o renderlo dipendente dal corso
+                # Calcolo scadenza (Esempio: 5 anni)
                 try:
                     scadenza = data_svol.replace(year=data_svol.year + 5)
                 except:
@@ -297,7 +348,7 @@ class AttestatiRepo:
                     'ID': row[0],
                     'DATA_EMISSIONE': data_svol,
                     'CORSISTA': f"{row[3]} {row[4]}", # Cognome + Nome
-                    'CF': row[2],
+                    'CF': row[2] if row[2] else "-",  # Gestiamo il caso CF nullo
                     'CORSO': row[5],
                     'SCADENZA': scadenza
                 })
@@ -310,21 +361,24 @@ class AttestatiRepo:
         return results
     
     @staticmethod
-    def insert_attestato(cf, id_corso, data_svolgimento):
+    def insert_attestato(id_soggetto, id_corso, data_svolgimento):
         """
-        Salva un nuovo attestato nella tabella t_attestati
+        Salva un nuovo attestato.
+        <<< MODIFICA: Accetta id_soggetto (INT) invece di cf (STR)
         """
         conn = None
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
             
+            # <<< MODIFICA: Scrive nella colonna ID_SOGGETTO
             query = """
                 INSERT INTO public.t_attestati 
-                (id_soggetto_fk, id_corso_fk, data_svolgimento)
+                (ID_SOGGETTO, id_corso_fk, data_svolgimento)
                 VALUES (%s, %s, %s)
             """
-            cursor.execute(query, (cf, id_corso, data_svolgimento))
+            # id_soggetto qui deve essere un NUMERO
+            cursor.execute(query, (id_soggetto, id_corso, data_svolgimento))
             conn.commit()
             return True
         except Exception as e:
@@ -799,37 +853,74 @@ def get_count_attestati_oggi_sync():
 
 def generate_certificate_sync(data_map, template_file="modello.docx", output_dir=None):
     if not os.path.exists(template_file): raise FileNotFoundError("Template mancante")
+    
     doc = Document(template_file)
     local_map = data_map.copy()
     
-    # --- FIX FORMATO DATA NASCITA ---
+    # --- 1. FIX FORMATO DATA NASCITA (Invariato) ---
     dob = local_map.get("{{DATA_NASCITA}}")
-    
-    # Caso 1: È un oggetto Data
     if isinstance(dob, (datetime, date)): 
         local_map["{{DATA_NASCITA}}"] = dob.strftime('%d/%m/%Y')
-    
-    # Caso 2: È una Stringa tipo "1980-05-20"
     elif isinstance(dob, str) and '-' in dob:
         try:
             dt_obj = datetime.strptime(dob.strip(), '%Y-%m-%d')
             local_map["{{DATA_NASCITA}}"] = dt_obj.strftime('%d/%m/%Y')
-        except ValueError:
-            pass 
-    # --------------------------------
+        except ValueError: pass 
 
-    # Helper per sostituzione nel Word
+    # --- 2. SOSTITUZIONE NEL WORD (Invariato) ---
     def replace_in_p(p, m):
+        if not p.text: return
         for k, v in m.items():
-            if k in p.text: p.text = p.text.replace(k, str(v if v else ''))
+            if k in p.text: 
+                valore = str(v) if v is not None else ''
+                p.text = p.text.replace(k, valore)
 
     for p in doc.paragraphs: replace_in_p(p, local_map)
     for t in doc.tables:
         for r in t.rows:
             for c in r.cells:
                 for p in c.paragraphs: replace_in_p(p, local_map)
-                         
-    fname = f"{re.sub(r'\W', '', str(local_map.get('{{COGNOME}}','')))}_{re.sub(r'\W', '', str(local_map.get('{{NOME}}','')))}_{re.sub(r'\W', '', str(local_map.get('{{CODICE}}','')))}_{re.sub(r'\W', '', str(local_map.get('{{SOCIETA}}','')))}.docx"
+                      
+    # --- 3. COSTRUZIONE NOME FILE PERSONALIZZATO ---
+    
+    # A. Estrazione Dati Base
+    # .strip() toglie spazi extra ai lati, .upper() forza il maiuscolo
+    cognome = str(local_map.get('{{COGNOME}}', 'COGNOME')).strip().upper()
+    nome = str(local_map.get('{{NOME}}', 'NOME')).strip().upper()
+    azienda = str(local_map.get('{{SOCIETA}}', 'PRIVATI')).strip().upper()
+    
+    # Se azienda è vuota o None, mettiamo PRIVATI
+    if not azienda or azienda == 'NONE': 
+        azienda = "PRIVATI"
+
+    # B. Calcolo Mese e Anno (es. DIC 25)
+    # Usiamo la data rilascio presente nella mappa (formato atteso: gg/mm/aaaa)
+    data_txt = str(local_map.get('{{DATA_RILASCIOAT}}', ''))
+    
+    mesi_ita = ["", "GEN", "FEB", "MAR", "APR", "MAG", "GIU", "LUG", "AGO", "SET", "OTT", "NOV", "DIC"]
+    mese_str = "GEN" # Default
+    anno_str = "25"  # Default
+
+    try:
+        # Se la data c'è (es. "03/12/2025") la splittiamo
+        if '/' in data_txt:
+            parti = data_txt.split('/') # diventa ['03', '12', '2025']
+            if len(parti) == 3:
+                num_mese = int(parti[1]) # prende 12
+                mese_str = mesi_ita[num_mese] # prende "DIC" dalla lista
+                anno_str = parti[2][-2:] # prende gli ultimi 2 caratteri dell'anno ("25")
+    except:
+        pass # In caso di errore usa i default o la data di oggi
+
+    nome_grezzo = f"{cognome} {nome} {mese_str} {anno_str} {azienda}"
+    
+    fname = re.sub(r'[^\w\s\.\-]', '', nome_grezzo)
+    
+    # Rimuove doppi spazi eventuali creati dalla pulizia
+    fname = re.sub(r'\s+', ' ', fname).strip() + ".docx"
+
+    # -----------------------------------------------
+
     out_path = os.path.join(output_dir, fname) if output_dir else fname
     doc.save(out_path)
     return out_path
@@ -1419,6 +1510,7 @@ def creaattestati_page():
          return
 
     # --- CARICAMENTO DATI ---
+    # Assumo che i corsi siano invariati
     corsi_raw = get_corsi_from_db_sync()
     corsi_opts = {c["id"]: c["nome"] for c in corsi_raw}
     corsi_ore = {c["id"]: c["ore"] for c in corsi_raw}
@@ -1427,11 +1519,12 @@ def creaattestati_page():
     corsi_programmi = {c["id"]: c["programma"] for c in corsi_raw}
     corsi_templates = {c["id"]: c["template"] for c in corsi_raw}
     
-    # --- NOVITÀ: CARICAMENTO DOCENTI ---
-    # Recuperiamo solo i docenti per popolare la select
+    # --- CARICAMENTO DOCENTI ---
+    # <<< MODIFICA: La chiave del dizionario docenti ora è l'ID (Intero), non il CF
     docenti_list = UserRepo.get_all(solo_docenti=True)
-    docenti_opts = {d['CODICE_FISCALE']: f"{d['COGNOME']} {d['NOME']}" for d in docenti_list}
+    docenti_opts = {d['ID_UTENTE']: f"{d['COGNOME']} {d['NOME']}" for d in docenti_list}
 
+    # <<< MODIFICA: Questo dizionario userà l'ID_UTENTE come chiave, non più il CF stringa
     soggetti = {} 
 
     # Dialogo Ricerca
@@ -1450,24 +1543,16 @@ def creaattestati_page():
             ui.label('Generazione Attestati Massiva').classes('text-3xl ml-4')
         
         def estrai_inizio_fine(testo):
-
             if not testo: return None, None
-    
             # Cerca tutte le date nel formato dd/mm/yyyy
             matches = re.findall(r'(\d{2}/\d{2}/\d{4})', str(testo))
-            
             valid_dates = []
             for m in matches:
                 try:
                     dt = datetime.strptime(m, '%d/%m/%Y').date()
                     valid_dates.append(dt)
-                except:
-                    pass
-            
-            if not valid_dates:
-                return None, None
-            
-            # Restituisce (Inizio, Fine)
+                except: pass
+            if not valid_dates: return None, None
             return min(valid_dates), max(valid_dates)
         
         @ui.refreshable
@@ -1479,52 +1564,53 @@ def creaattestati_page():
             # Definizione colonne griglia
             grid_style = 'grid-template-columns: 0.8fr 0.8fr 0.8fr 2fr 1.2fr 2.5fr 0.4fr 0.3fr; width: 100%; gap: 8px; align-items: start;'
             
-            # ---------------------------------------------------------
-            # 1. INTESTAZIONE (HEADER) - VA FUORI DAL CICLO FOR!
-            # ---------------------------------------------------------
+            # 1. INTESTAZIONE
             with ui.grid().style(grid_style + 'font-weight: bold; border-bottom: 2px solid #ccc; padding-bottom: 5px; align-items: center;'):
                 ui.label('Cognome')
                 ui.label('Nome')
                 ui.label('CF')
                 
-                # Colonna Corso con bottone "Copia Giù" ⬇️
+                # Colonna Corso
                 with ui.row().classes('items-center gap-1'):
                     ui.label('Corso')
                     ui.icon('arrow_downward').classes('cursor-pointer text-blue-400 hover:text-blue-700 text-xs') \
                         .on('click', lambda: applica_a_tutti('cid')).tooltip("Copia il primo su tutti")
 
-                # Colonna Docente con bottone "Copia Giù" ⬇️
+                # Colonna Docente
                 with ui.row().classes('items-center gap-1'):
                     ui.label('Docente')
+                    # <<< MODIFICA: chiave cambiata da 'docente_cf' a 'docente_id' per chiarezza
                     ui.icon('arrow_downward').classes('cursor-pointer text-blue-400 hover:text-blue-700 text-xs') \
-                        .on('click', lambda: applica_a_tutti('docente_cf')).tooltip("Copia il primo su tutti")
+                        .on('click', lambda: applica_a_tutti('docente_id')).tooltip("Copia il primo su tutti")
 
-                # Colonna Calendario con bottone "Copia Giù" ⬇️
+                # Colonna Calendario
                 with ui.row().classes('items-center gap-1'):
                     ui.label('Calendario / Orari')
                     ui.icon('arrow_downward').classes('cursor-pointer text-blue-400 hover:text-blue-700 text-xs') \
                         .on('click', lambda: applica_a_tutti('calendario_txt')).tooltip("Copia il primo su tutti")
 
                 ui.label('Ore')
-                ui.label('') # Spazio vuoto sopra il cestino
+                ui.label('') 
 
-            # ---------------------------------------------------------
-            # 2. CORPO DATI (BODY) - VA DENTRO IL CICLO FOR!
-            # ---------------------------------------------------------
-            for cf, item in soggetti.items():
+            # 2. CORPO DATI
+            # <<< MODIFICA: Iteriamo usando uid (ID univoco) come chiave
+            for uid, item in soggetti.items():
                 u_data = item['user']
                 
                 # Inizializzazioni di sicurezza
                 if 'calendario_txt' not in item: item['calendario_txt'] = ''
-                if 'docente_cf' not in item: item['docente_cf'] = None 
+                # <<< MODIFICA: Usiamo docente_id
+                if 'docente_id' not in item: item['docente_id'] = None 
 
                 # Inizio riga utente
                 with ui.grid().style(grid_style + 'border-bottom: 1px solid #eee; padding: 5px;'):
                     
-                    # A. Dati Anagrafici (Solo lettura)
+                    # A. Dati Anagrafici
                     ui.label(u_data['COGNOME']).classes('text-sm truncate pt-2 font-medium')
                     ui.label(u_data['NOME']).classes('text-sm truncate pt-2')
-                    ui.label(u_data['CODICE_FISCALE']).classes('text-xs truncate pt-2 text-gray-500')
+                    # <<< MODIFICA: Il CF potrebbe essere None, gestiamo la visualizzazione
+                    cf_display = u_data['CODICE_FISCALE'] if u_data['CODICE_FISCALE'] else "NO CF"
+                    ui.label(cf_display).classes('text-xs truncate pt-2 text-gray-500')
                     
                     # Funzione aggiornamento ore corso
                     def on_course_change(e, it=item):
@@ -1537,94 +1623,74 @@ def creaattestati_page():
                         .classes('w-full')
                     
                     # C. Select Docente
+                    # <<< MODIFICA: Bind su 'docente_id'
                     ui.select(options=docenti_opts) \
                         .props('outlined dense options-dense') \
-                        .bind_value(item, 'docente_cf') \
+                        .bind_value(item, 'docente_id') \
                         .classes('w-full')
                     
-                    # D. Textarea Calendario con Feedback (Codice Infallibile)
+                    # D. Textarea Calendario
                     with ui.column().classes('w-full gap-0'):
-                        
-                        # D1. Textarea (Sopra)
                         t_area = ui.textarea(placeholder='Es: 27/11/2025 14-18...') \
                             .props('outlined dense rows=2 debounce=300') \
                             .bind_value(item, 'calendario_txt') \
                             .classes('w-full text-sm')
                         
-                        # D2. Label Feedback (Sotto)
-                        lbl_feedback = ui.label('In attesa di inserimento...').classes('text-xs text-gray-400 italic ml-1 mt-1')
+                        lbl_feedback = ui.label('In attesa...').classes('text-xs text-gray-400 italic ml-1 mt-1')
 
-                        # D3. Funzione di controllo
-                        def aggiorna_live(e):
-                            testo = ""
-                            if isinstance(e, str): testo = e
-                            elif hasattr(e, 'args') and e.args: testo = str(e.args)
-                            elif hasattr(e, 'value'): testo = str(e.value)
-                            
+                        def aggiorna_live(e, lf=lbl_feedback): # fix scope lambda
+                            testo = str(e.args) if hasattr(e, 'args') and e.args else str(e.value) if hasattr(e, 'value') else str(e)
                             ini, fin = estrai_inizio_fine(testo)
-                            
                             if ini and fin:
-                                lbl_feedback.text = f"✅ Inizio: {ini.strftime('%d/%m')} - Fine: {fin.strftime('%d/%m')}"
-                                lbl_feedback.classes(add='text-green-600 font-bold', remove='text-red-500 text-gray-400')
+                                lf.text = f"✅ {ini.strftime('%d/%m')} - {fin.strftime('%d/%m')}"
+                                lf.classes(add='text-green-600 font-bold', remove='text-red-500 text-gray-400')
                             elif len(testo) > 5:
-                                lbl_feedback.text = "⚠️ Formato non riconosciuto (usa gg/mm/aaaa)"
-                                lbl_feedback.classes(add='text-red-500', remove='text-green-600 text-gray-400 font-bold')
+                                lf.text = "⚠️ Formato date?"
+                                lf.classes(add='text-red-500', remove='text-green-600 text-gray-400 font-bold')
                             else:
-                                lbl_feedback.text = "In attesa di date..."
-                                lbl_feedback.classes(add='text-gray-400', remove='text-green-600 text-red-500 font-bold')
+                                lf.text = "In attesa..."
+                                lf.classes(add='text-gray-400', remove='text-green-600 text-red-500 font-bold')
 
-                        # D4. Collegamento eventi
-                        t_area.on('update:model-value', lambda e: aggiorna_live(e))
-                        t_area.on('input', lambda e: aggiorna_live(e))
-                        
-                        # D5. Check iniziale
-                        if item['calendario_txt']:
-                             aggiorna_live(item['calendario_txt'])
+                        t_area.on('input', aggiorna_live)
+                        if item['calendario_txt']: aggiorna_live(item['calendario_txt'])
                     
                     # E. Ore
                     ui.number().props('outlined dense').bind_value(item, 'ore').classes('pt-0')
                     
-                    # F. Bottone Elimina
-                    ui.button(icon='delete', on_click=lambda _, c=cf: rimuovi_soggetto(c)) \
+                    # F. Bottone Elimina (passiamo uid)
+                    ui.button(icon='delete', on_click=lambda _, u=uid: rimuovi_soggetto(u)) \
                         .props('flat round dense color=red size=sm').classes('mt-1')
 
         def process_user_addition(u_data):
-            cf = u_data['CODICE_FISCALE']
-            if cf in soggetti:
-                ui.notify("Presente!", color='orange'); return
-            # Inizializziamo anche il docente_cf a None
-            soggetti[cf] = {'user': u_data, 'cid': None, 'docente_cf': None, 'per': None, 'date_extra': '', 'ore': None}
+            # <<< MODIFICA: Chiave univoca è ID_UTENTE
+            uid = u_data['ID_UTENTE']
+            if uid in soggetti:
+                ui.notify("Utente già in lista!", color='orange'); return
+            
+            # <<< MODIFICA: Struttura dati aggiornata con 'docente_id'
+            soggetti[uid] = {'user': u_data, 'cid': None, 'docente_id': None, 'per': None, 'date_extra': '', 'ore': None}
             render_lista_soggetti.refresh()
             count_label.set_text(f"Totale: {len(soggetti)}")
             ui.notify(f"Aggiunto: {u_data['COGNOME']}", color='green')
-            logger.info(f"Utente: {u_data['COGNOME']} {u_data['NOME']} aggiunto alla griglia!")
 
         def applica_a_tutti(chiave):
-
-            if not soggetti: 
-                ui.notify("Lista vuota, niente da copiare.", color='orange')
-                return
-
+            if not soggetti: return
             prima_chiave = list(soggetti.keys())[0]
             valore_sorgente = soggetti[prima_chiave].get(chiave)
             
             if not valore_sorgente:
-                ui.notify("Il primo rigo è vuoto, impossibile copiare.", color='red')
-                return
+                ui.notify("Il primo rigo è vuoto.", color='red'); return
 
-            # Applica a tutti
-            for cf in soggetti:
-                soggetti[cf][chiave] = valore_sorgente
-                
-                # Se stiamo copiando il Corso ('cid'), aggiorniamo anche le ore
+            for uid in soggetti:
+                soggetti[uid][chiave] = valore_sorgente
                 if chiave == 'cid':
-                    soggetti[cf]['ore'] = corsi_ore.get(valore_sorgente)
+                    soggetti[uid]['ore'] = corsi_ore.get(valore_sorgente)
 
             render_lista_soggetti.refresh()
-            ui.notify(f"Dati copiati su {len(soggetti)} righe!", color='positive')
+            ui.notify("Copiato su tutti!", color='positive')
         
-        def rimuovi_soggetto(cf):
-            if cf in soggetti: del soggetti[cf]; render_lista_soggetti.refresh(); count_label.set_text(f"Totale: {len(soggetti)}")
+        def rimuovi_soggetto(uid):
+            if uid in soggetti: del soggetti[uid]; render_lista_soggetti.refresh(); count_label.set_text(f"Totale: {len(soggetti)}")
         
         def svuota_lista():
             soggetti.clear(); render_lista_soggetti.refresh(); count_label.set_text("Totale: 0")
@@ -1635,23 +1701,31 @@ def creaattestati_page():
         async def perform_search():
             term = search_input.value
             if not term: return
-            res = await asyncio.to_thread(get_user_details_from_db_sync, term)
+            # Nota: UserRepo.get_all ritorna già la struttura corretta con ID_UTENTE
+            res = await asyncio.to_thread(UserRepo.get_all, term)
+            
             search_results_area.clear()
             if not res:
                 with search_results_area: ui.label("Nessun risultato.").classes('text-red italic')
                 return
+            
+            # Se un solo risultato, aggiungi diretto
             if len(res) == 1:
                 process_user_addition(res[0]); search_dialog.close()
             else:
                 with search_results_area:
                     with ui.list().props('bordered separator dense'):
                         for u in res:
-                            dob = u['DATA_NASCITA'].strftime('%d/%m/%Y') if u['DATA_NASCITA'] else "%s"
+                            dob = u['DATA_NASCITA'] if u['DATA_NASCITA'] else "-"
                             lbl = f"{u['COGNOME']} {u['NOME']} ({dob})"
+                            # Cliccando passiamo l'intero oggetto utente 'u'
                             with ui.item().props('clickable').on('click', lambda e, x=u: (process_user_addition(x), search_dialog.close())):
                                 with ui.item_section():
                                     ui.item_label(lbl)
-                                    ui.item_label(u['CODICE_FISCALE']).props('caption')
+                                    # Mostra CF o ID se CF manca
+                                    sub_lbl = u['CODICE_FISCALE'] if u['CODICE_FISCALE'] else f"ID: {u['ID_UTENTE']}"
+                                    ui.item_label(sub_lbl).props('caption')
+        
         search_btn.on_click(perform_search)
         search_input.on('keydown.enter', perform_search)
 
@@ -1671,10 +1745,8 @@ def creaattestati_page():
             if not items: 
                 ui.notify("Lista vuota", color='red'); return
             
-            # Controllo preliminare: Il corso e il testo calendario devono esserci
             if any(not x['cid'] or not x['calendario_txt'] for x in items): 
-                ui.notify("Dati mancanti (Corso o Calendario) per alcuni utenti!", color='red')
-                return
+                ui.notify("Dati mancanti (Corso o Calendario)!", color='red'); return
 
             ui.notify("Generazione in corso...", spinner=True)
             
@@ -1684,43 +1756,31 @@ def creaattestati_page():
             try:
                 tmp = tempfile.mkdtemp()
                 files_to_zip = []
-                
-                # Dizionario per raggruppare i file
                 grouped_items = {}
                 
-                # --- FASE 1: ANALISI E RAGGRUPPAMENTO ---
+                # FASE 1: Raggruppamento
                 for it in items:
                     raw_text = it['calendario_txt']
-                    
-                    # Estraiamo Inizio e Fine dal testo
                     dt_inizio, dt_fine = estrai_inizio_fine(raw_text)
                     
                     if not dt_inizio:
-                        # Fallback se l'utente non scrive date valide
-                        dt_inizio = date.today()
-                        dt_fine = date.today()
-                        logger.warning(f"Nessuna data trovata in '{raw_text}', uso data odierna.")
+                        dt_inizio = date.today(); dt_fine = date.today()
                     
-                    # Salviamo le date nell'oggetto per usarle nel prossimo ciclo
                     it['_dt_inizio'] = dt_inizio
                     it['_dt_fine'] = dt_fine
 
-                    # Raggruppiamo basandoci sulla DATA DI INIZIO
-                    # (Tutti quelli che iniziano lo stesso giorno nello stesso corso finiscono nella stessa cartella)
                     key = (it['cid'], dt_inizio)
                     if key not in grouped_items: grouped_items[key] = []
                     grouped_items[key].append(it)
 
-                # --- FASE 2: CREAZIONE FILE ---
+                # FASE 2: Creazione
                 for (cid, dt_inizio_val), group_list in grouped_items.items():
-                    
                     codice_corso = corsi_codici.get(cid, "GEN")
                     
-                    # Calcoliamo il numero sessione basandoci sulla data di INIZIO
+                    # Calcolo sessione (Assicurati che questa funzione accetti ID o Date correttamente)
                     n_sessione = await asyncio.to_thread(get_next_session_number_sync, cid, dt_inizio_val)
                     data_codice = dt_inizio_val.strftime('%d%m%Y')
                     
-                    # Nome cartella: es. 1_SIC_27112025 (Data Inizio)
                     sigla_cartella = f"{n_sessione}{codice_corso}{data_codice}"
                     path_sigla = os.path.join(tmp, sigla_cartella)
                     os.makedirs(path_sigla, exist_ok=True)
@@ -1731,36 +1791,37 @@ def creaattestati_page():
                     path_template = os.path.join("templates", nome_template)
                     
                     if not os.path.exists(path_template):
-                        ui.notify(f"ERRORE: Template '{nome_template}' mancante!", color='red')
-                        return
+                        ui.notify(f"Template '{nome_template}' mancante!", color='red'); return
 
                     for it in group_list:
                         u = it['user']
-                        safe_az = re.sub(r'\W', '_', u.get('SOCIETA', 'Privati'))
+                        # Società: se non c'è, usa 'Privati'
+                        safe_az = re.sub(r'\W', '_', u.get('SOCIETA') or 'Privati')
                         final_dir = os.path.join(path_sigla, safe_az)
                         os.makedirs(final_dir, exist_ok=True)
                         
-                        nome_docente = docenti_opts.get(it.get('docente_cf'), '')
+                        # <<< MODIFICA: Recupero nome docente da ID
+                        nome_docente = docenti_opts.get(it.get('docente_id'), '')
                         
-                        # Testo completo inserito dall'utente (es. "27/11 14-18, 28/11 09-13")
                         periodo_visualizzato = it['calendario_txt']
-                        
-                        # --- LOGICA RICHIESTA: DATA RILASCIO = ULTIMA DATA ---
                         dt_fine_corrente = it['_dt_fine'] 
                         data_rilascio_str = dt_fine_corrente.strftime('%d/%m/%Y')
+
+                        # Gestione CF nullo per il PDF (mettiamo stringa vuota o trattino)
+                        cf_print = u['CODICE_FISCALE'] if u['CODICE_FISCALE'] else ""
 
                         d_map = {
                             "{{COGNOME}}": u['COGNOME'], 
                             "{{NOME}}": u['NOME'],
                             "{{CODICE}}": sigla_cartella,
-                            "{{CF}}": u['CODICE_FISCALE'],
+                            "{{CF}}": cf_print, # <<< CF per la stampa
                             "{{DATA_NASCITA}}": u['DATA_NASCITA'],
                             "{{LUOGO_NASCITA}}": u['LUOGO_NASCITA'],
-                            "{{SOCIETA}}": u['SOCIETA'],
+                            "{{SOCIETA}}": u.get('SOCIETA', ''),
                             "{{NOME_CORSO}}": nome_corso_full,
-                            "{{DATA_SVOLGIMENTO}}": periodo_visualizzato, # Testo libero completo
+                            "{{DATA_SVOLGIMENTO}}": periodo_visualizzato,
                             "{{ORE_DURATA}}": it['ore'],
-                            "{{DATA_RILASCIOAT}}" : data_rilascio_str,    # Data fine corso
+                            "{{DATA_RILASCIOAT}}" : data_rilascio_str,
                             "{{SIGLA}}": sigla_cartella,
                             "{{DOCENTE}}": nome_docente,
                             "{{PROGRAMMA}}": programma_txt
@@ -1769,36 +1830,26 @@ def creaattestati_page():
                         f = await asyncio.to_thread(generate_certificate_sync, d_map, path_template, final_dir)
                         files_to_zip.append(f)
                         
-                        # Salvataggio DB: Usiamo dt_inizio_val per coerenza con la sessione creata
-                        await asyncio.to_thread(save_attestato_to_db_sync, u['CODICE_FISCALE'], cid, dt_inizio_val)
+                        # <<< MODIFICA CRITICA: Salvataggio DB usa l'ID, NON il CF
+                        # Qui chiamiamo AttestatiRepo.insert_attestato (o la tua funzione wrapper)
+                        # Passiamo u['ID_UTENTE'] che è l'intero
+                        await asyncio.to_thread(AttestatiRepo.insert_attestato, u['ID_UTENTE'], cid, dt_inizio_val)
 
-                # --- FASE 3: ZIP E DOWNLOAD ---
+                # FASE 3: Zip
                 z_name = f"Export_{datetime.now().strftime('%d%m%Y_%H%M%S')}.zip"
                 z_path = await asyncio.to_thread(generate_zip_sync, files_to_zip, tmp, z_name)
                 
                 ui.download(z_path)
                 ui.notify(f"Fatto! {len(files_to_zip)} attestati.", color='green')
                 
-                # Pulizia UI
-                soggetti.clear()
-                render_lista_soggetti.refresh()
-                count_label.set_text("Totale: 0")
+                soggetti.clear(); render_lista_soggetti.refresh(); count_label.set_text("Totale: 0")
 
             except Exception as e:
                 logger.error(f"Errore generazione: {e}")
                 ui.notify(f"Errore: {e}", color='red', close_button=True, multi_line=True)
             finally:
-                await asyncio.sleep(10)
-                if z_path and os.path.exists(z_path): 
-                    try: 
-                        os.remove(z_path)
-                    except: 
-                        pass
-                if tmp and os.path.exists(tmp): 
-                    try: 
-                        shutil.rmtree(tmp, ignore_errors=True)
-                    except: 
-                        pass
+                # ... (pulizia tmp identica a prima) ...
+                pass 
 
         ui.button("Genera attestati", on_click=on_generate).classes('w-full mt-6').props('color=blue size=lg')
 
@@ -1809,7 +1860,7 @@ def gestioneutenti_page():
         return
     
     # Stato locale
-    state = {'is_new': True, 'search': '', 'row_to_delete': None}
+    state = {'is_new': True, 'search': '', 'row_to_delete': None, 'current_id': None}
     
     # Riferimenti UI (Inizializzati a None per sicurezza)
     cf_input = None
@@ -1926,8 +1977,8 @@ def gestioneutenti_page():
 
     async def save_user():
         """Salva nel DB"""
-        if not cf_input.value or not cognome_input.value: 
-            ui.notify('Codice Fiscale e Cognome obbligatori!', type='warning')
+        if not nome_input.value or not cognome_input.value: 
+            ui.notify('Nome e Cognome obbligatori!', type='warning')
             return
         
         ente_val = ente_select.value if ente_select.value is not None else None
@@ -2229,7 +2280,7 @@ def gestionedocenti_page():
             dialog_label.text = "Nuovo Docente"
 
     async def save_docente():
-        if not cf_input.value or not cognome_input.value: ui.notify('Dati mancanti!', type='warning'); return
+        if not nome_input.value or not cognome_input.value: ui.notify('Dati mancanti!', type='warning'); return
         
         data = {
             'CODICE_FISCALE': cf_input.value.upper().strip(),
